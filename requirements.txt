@@ -1,0 +1,24 @@
+# Minmo-Engine Dependencies
+# MCP 통합 자동화 프레임워크
+
+# MCP 프레임워크
+fastmcp>=0.1.0
+
+# Redis 클라이언트 (상태 관리)
+redis>=5.0.0
+
+# Gemini API (지휘관)
+google-generativeai>=0.8.0
+
+# CLI UI
+rich>=13.0.0
+
+# 프로세스 관리
+pexpect>=4.8.0
+watchdog>=3.0.0
+
+# 설정 파일
+pyyaml>=6.0
+
+# 타입 힌팅 (Python 3.9+ 내장, 하위 호환용)
+typing-extensions>=4.0.0

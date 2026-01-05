@@ -1,0 +1,50 @@
+{
+  "$schema": "https://claude.ai/schemas/claude-code-config.json",
+  "_comment": "Scribe MCP 서버를 Claude Code에 등록하기 위한 설정",
+
+  "mcpServers": {
+    "scribe": {
+      "command": "python",
+      "args": ["scribe_mcp.py"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "REDIS_HOST": "localhost",
+        "REDIS_PORT": "6379"
+      }
+    }
+  },
+
+  "_setup_guide": {
+    "step1": "의존성 설치: pip install -r requirements.txt",
+    "step2": "Redis 서버 실행 확인: redis-cli ping",
+    "step3": "Claude Code 설정 파일 위치에 mcpServers 섹션 복사",
+    "step4_windows": "~/.claude/settings.json 또는 프로젝트별 .claude/settings.json",
+    "step4_mac_linux": "~/.config/claude-code/settings.json"
+  },
+
+  "_available_tools": {
+    "search_history": {
+      "description": "SQLite 로그 조회 (SELECT 쿼리만 허용)",
+      "example": "search_history(sql=\"SELECT * FROM work_history LIMIT 10\")"
+    },
+    "get_state": {
+      "description": "Redis에서 flow/todo 상태 조회",
+      "example": "get_state(category=\"flow\")"
+    },
+    "update_todo": {
+      "description": "작업 상태 변경",
+      "example": "update_todo(task_id=\"task_001\", status=\"completed\")"
+    },
+    "log_event": {
+      "description": "작업 내역을 SQLite/Redis에 동시 기록",
+      "example": "log_event(agent=\"planner\", content=\"작업 분석 완료\")"
+    }
+  },
+
+  "_security_notes": [
+    "search_history는 SELECT 쿼리만 허용합니다",
+    "DELETE, DROP, UPDATE, ALTER, INSERT 등은 자동 차단됩니다",
+    "SQLite는 read-only 모드로 연결됩니다 (search_history)",
+    "log_event만 쓰기 권한을 가집니다"
+  ]
+}
