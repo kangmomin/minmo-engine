@@ -22,6 +22,14 @@ from rich import box
 from minmo import __version__
 from minmo.orchestrator import MinmoOrchestrator
 from minmo.indexer import CodeIndexer
+from minmo.gemini_wrapper import (
+    GeminiWrapper,
+    InterviewQuestion,
+    FeatureSpec,
+    PlanTask,
+    PlanModeResult
+)
+from minmo.scribe_mcp import get_conventions, get_architecture_info, save_feature_spec
 
 console = Console()
 
@@ -337,6 +345,380 @@ def cmd_overview(args):
         console.print(f"[red]개요 조회 오류: {e}[/red]")
 
 
+# ============================================================
+# Plan Mode 명령어
+# ============================================================
+
+def _ask_interview_question(question: InterviewQuestion) -> str:
+    """인터뷰 질문을 사용자에게 보여주고 답변을 받습니다."""
+    # 질문 패널 표시
+    focus_labels = {
+        "architecture": "아키텍처",
+        "data_model": "데이터 모델",
+        "exception_handling": "예외 처리",
+        "convention": "컨벤션",
+        "integration": "통합",
+        "testing": "테스트"
+    }
+
+    focus_label = focus_labels.get(question.focus.value, question.focus.value)
+
+    console.print(Panel(
+        f"[bold]{question.question}[/bold]\n\n"
+        f"[dim]{question.context}[/dim]",
+        title=f"[cyan]질문[/cyan] [{focus_label}]",
+        box=box.ROUNDED,
+        border_style="cyan"
+    ))
+
+    # 옵션 표시
+    if question.options:
+        console.print("\n[bold]선택 가능한 옵션:[/bold]")
+        for i, opt in enumerate(question.options, 1):
+            console.print(f"  [cyan]{i}.[/cyan] {opt}")
+        console.print(f"  [cyan]0.[/cyan] 직접 입력")
+        console.print()
+
+        # 선택 받기
+        while True:
+            try:
+                choice = console.input("[bold cyan]선택 (번호 또는 텍스트)>[/bold cyan] ").strip()
+
+                if choice.isdigit():
+                    idx = int(choice)
+                    if idx == 0:
+                        answer = console.input("[bold cyan]답변>[/bold cyan] ").strip()
+                        break
+                    elif 1 <= idx <= len(question.options):
+                        answer = question.options[idx - 1]
+                        break
+                    else:
+                        console.print("[red]유효하지 않은 번호입니다.[/red]")
+                else:
+                    # 텍스트로 직접 입력
+                    answer = choice
+                    break
+            except KeyboardInterrupt:
+                raise
+    else:
+        answer = console.input("[bold cyan]답변>[/bold cyan] ").strip()
+
+    console.print()
+    return answer
+
+
+def _review_spec(spec: FeatureSpec) -> bool:
+    """기획서를 사용자에게 보여주고 승인을 받습니다."""
+    console.print(Panel(
+        f"[bold]{spec.feature_name}[/bold]\n\n{spec.summary}",
+        title="[green]기획서 생성 완료[/green]",
+        box=box.ROUNDED,
+        border_style="green"
+    ))
+
+    # 요구사항
+    if spec.requirements:
+        console.print("\n[bold]요구사항:[/bold]")
+        for req in spec.requirements:
+            console.print(f"  • {req}")
+
+    # 아키텍처 결정사항
+    if spec.architecture_decisions:
+        console.print("\n[bold]아키텍처 결정:[/bold]")
+        for dec in spec.architecture_decisions:
+            console.print(f"  • {dec}")
+
+    # 에러 핸들링
+    if spec.error_handling:
+        console.print("\n[bold]에러 처리:[/bold]")
+        for err in spec.error_handling:
+            console.print(f"  • {err}")
+
+    # 컨벤션
+    if spec.conventions:
+        console.print("\n[bold]준수할 컨벤션:[/bold]")
+        for conv in spec.conventions:
+            console.print(f"  • {conv}")
+
+    # 제외 범위
+    if spec.out_of_scope:
+        console.print("\n[bold]범위 외 (미구현):[/bold]")
+        for oos in spec.out_of_scope:
+            console.print(f"  • [dim]{oos}[/dim]")
+
+    console.print()
+
+    # 승인 여부 확인
+    while True:
+        choice = console.input("[bold]기획서를 승인하시겠습니까? [/bold][cyan](y/n/e=수정)[/cyan] ").strip().lower()
+        if choice in ('y', 'yes'):
+            return True
+        elif choice in ('n', 'no'):
+            return False
+        elif choice in ('e', 'edit'):
+            console.print("[yellow]기획서 수정은 아직 지원되지 않습니다. 다시 시작해주세요.[/yellow]")
+            return False
+
+
+def _review_tasks(tasks: list[PlanTask]) -> bool:
+    """태스크 목록을 사용자에게 보여주고 승인을 받습니다."""
+    console.print(Panel(
+        f"[bold]총 {len(tasks)}개 태스크[/bold]",
+        title="[cyan]작업 분해 결과[/cyan]",
+        box=box.ROUNDED,
+        border_style="cyan"
+    ))
+
+    for i, task in enumerate(tasks, 1):
+        tree = Tree(f"[bold cyan]{i}. {task.title}[/bold cyan] ({task.id})")
+        tree.add(f"[bold]목표:[/bold] {task.goal}")
+
+        if task.files_to_modify:
+            files_branch = tree.add("[bold]수정 파일:[/bold]")
+            for f in task.files_to_modify:
+                files_branch.add(f"[dim]{f}[/dim]")
+
+        if task.expected_logic:
+            logic_preview = task.expected_logic[:200]
+            if len(task.expected_logic) > 200:
+                logic_preview += "..."
+            tree.add(f"[bold]예상 로직:[/bold] {logic_preview}")
+
+        if task.dependencies:
+            tree.add(f"[bold]선행 작업:[/bold] {', '.join(task.dependencies)}")
+
+        if task.acceptance_criteria:
+            criteria_branch = tree.add("[bold]완료 조건:[/bold]")
+            for c in task.acceptance_criteria:
+                criteria_branch.add(f"[dim]✓ {c}[/dim]")
+
+        console.print(tree)
+        console.print()
+
+    # 승인 여부 확인
+    console.print(Panel(
+        "[bold yellow]중요:[/bold yellow] 승인하면 작업이 시작됩니다.\n"
+        "거부하면 기획 단계를 종료하고 수정 후 다시 시작할 수 있습니다.",
+        box=box.ROUNDED,
+        border_style="yellow"
+    ))
+
+    while True:
+        choice = console.input("[bold]모든 태스크를 승인하시겠습니까? [/bold][cyan](y/n)[/cyan] ").strip().lower()
+        if choice in ('y', 'yes'):
+            return True
+        elif choice in ('n', 'no'):
+            return False
+
+
+def _generate_spec_markdown(spec: FeatureSpec, result: PlanModeResult) -> str:
+    """기획서를 마크다운 문자열로 변환합니다."""
+    lines = [
+        f"# {spec.feature_name}",
+        "",
+        f"## 요약",
+        spec.summary,
+        "",
+    ]
+
+    if spec.requirements:
+        lines.append("## 요구사항")
+        for req in spec.requirements:
+            lines.append(f"- {req}")
+        lines.append("")
+
+    if spec.architecture_decisions:
+        lines.append("## 아키텍처 결정")
+        for dec in spec.architecture_decisions:
+            lines.append(f"- {dec}")
+        lines.append("")
+
+    if spec.data_model:
+        lines.append("## 데이터 모델")
+        lines.append("```json")
+        import json
+        lines.append(json.dumps(spec.data_model, indent=2, ensure_ascii=False))
+        lines.append("```")
+        lines.append("")
+
+    if spec.error_handling:
+        lines.append("## 에러 처리")
+        for err in spec.error_handling:
+            lines.append(f"- {err}")
+        lines.append("")
+
+    if spec.conventions:
+        lines.append("## 준수 컨벤션")
+        for conv in spec.conventions:
+            lines.append(f"- {conv}")
+        lines.append("")
+
+    if spec.constraints:
+        lines.append("## 제약 조건")
+        for con in spec.constraints:
+            lines.append(f"- {con}")
+        lines.append("")
+
+    if spec.out_of_scope:
+        lines.append("## 범위 외")
+        for oos in spec.out_of_scope:
+            lines.append(f"- {oos}")
+        lines.append("")
+
+    if result.tasks:
+        lines.append("## 태스크 목록")
+        for task in result.tasks:
+            lines.append(f"### {task.id}: {task.title}")
+            lines.append(f"- **목표:** {task.goal}")
+            if task.files_to_modify:
+                lines.append(f"- **파일:** {', '.join(task.files_to_modify)}")
+            if task.expected_logic:
+                lines.append(f"- **로직:** {task.expected_logic}")
+            if task.acceptance_criteria:
+                lines.append("- **완료 조건:**")
+                for c in task.acceptance_criteria:
+                    lines.append(f"  - {c}")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def cmd_plan(args):
+    """Plan Mode - 기획/설계 단계를 실행합니다."""
+    goal = args.goal
+
+    console.print(Panel(
+        f"[bold cyan]Plan Mode[/bold cyan]\n\n"
+        f"[dim]요구사항을 분석하고 기획서를 생성합니다.[/dim]\n"
+        f"[dim]승인 전까지 실제 작업은 시작되지 않습니다.[/dim]",
+        box=box.DOUBLE,
+        border_style="cyan"
+    ))
+    console.print()
+
+    console.print(f"[bold]목표:[/bold] {goal}")
+    console.print()
+
+    try:
+        # 1. 프로젝트 컨텍스트 수집
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+            transient=True
+        ) as progress:
+            task = progress.add_task("프로젝트 분석 중...", total=None)
+
+            project_context = {}
+            existing_conventions = []
+            architecture_info = None
+
+            # 컨벤션 조회
+            try:
+                conv_result = get_conventions()
+                if conv_result.get("success"):
+                    existing_conventions = conv_result.get("conventions", [])
+                    project_context["naming_patterns"] = conv_result.get("naming_patterns", {})
+            except Exception:
+                pass
+
+            # 아키텍처 정보 조회
+            try:
+                arch_result = get_architecture_info()
+                if arch_result.get("success"):
+                    architecture_info = arch_result
+                    project_context["directories"] = arch_result.get("directories", [])
+                    project_context["layers"] = arch_result.get("layers", [])
+            except Exception:
+                pass
+
+            progress.update(task, description="[green]프로젝트 분석 완료[/green]")
+
+        if existing_conventions:
+            console.print("[bold]감지된 컨벤션:[/bold]")
+            for conv in existing_conventions:
+                console.print(f"  • [dim]{conv}[/dim]")
+            console.print()
+
+        # 2. GeminiWrapper 초기화
+        try:
+            commander = GeminiWrapper()
+        except ValueError as e:
+            console.print(f"[red]오류: {e}[/red]")
+            console.print("[dim]GEMINI_API_KEY 환경변수를 설정해주세요.[/dim]")
+            return
+
+        # 3. Plan Mode 실행
+        console.print(Panel(
+            "[bold]인터뷰를 시작합니다[/bold]\n\n"
+            "[dim]아키텍처, 데이터 모델, 예외 처리, 컨벤션에 대한 질문에 답해주세요.[/dim]",
+            box=box.ROUNDED,
+            border_style="yellow"
+        ))
+        console.print()
+
+        result = commander.run_plan_mode(
+            user_goal=goal,
+            project_context=project_context,
+            existing_conventions=existing_conventions,
+            architecture_info=architecture_info,
+            on_question=_ask_interview_question,
+            on_spec_review=_review_spec,
+            on_tasks_review=_review_tasks
+        )
+
+        # 4. 결과 처리
+        if result.approved:
+            console.print(Panel(
+                "[bold green]Plan Mode 완료 - 승인됨[/bold green]\n\n"
+                f"기획서: {result.feature_spec.feature_name}\n"
+                f"태스크: {len(result.tasks)}개",
+                box=box.DOUBLE,
+                border_style="green"
+            ))
+
+            # 기획서 저장
+            spec_content = _generate_spec_markdown(result.feature_spec, result)
+            save_result = save_feature_spec(
+                feature_name=result.feature_spec.feature_name,
+                content=spec_content
+            )
+
+            if save_result.get("success"):
+                console.print(f"\n[green]기획서 저장 완료:[/green] {save_result['file_path']}")
+                result.spec_file_path = save_result['file_path']
+            else:
+                console.print(f"[yellow]기획서 저장 실패: {save_result.get('error')}[/yellow]")
+
+            # 실행 여부 확인
+            console.print()
+            execute = console.input("[bold]지금 바로 실행하시겠습니까? [/bold][cyan](y/n)[/cyan] ").strip().lower()
+
+            if execute in ('y', 'yes'):
+                console.print("\n[cyan]작업 실행을 시작합니다...[/cyan]\n")
+                # TODO: 오케스트레이터로 태스크 실행
+                console.print("[yellow]태스크 실행 기능은 아직 구현 중입니다.[/yellow]")
+            else:
+                console.print("\n[dim]'minmo run' 명령으로 나중에 실행할 수 있습니다.[/dim]")
+
+        else:
+            console.print(Panel(
+                "[bold yellow]Plan Mode 종료 - 미승인[/bold yellow]\n\n"
+                "[dim]기획서가 승인되지 않았습니다.[/dim]\n"
+                "[dim]요구사항을 수정하고 다시 시도해주세요.[/dim]",
+                box=box.ROUNDED,
+                border_style="yellow"
+            ))
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]사용자에 의해 중단되었습니다.[/yellow]")
+    except Exception as e:
+        console.print(f"\n[red]오류 발생: {e}[/red]")
+        import traceback
+        if args.verbose:
+            traceback.print_exc()
+
+
 def main():
     """메인 진입점"""
     parser = argparse.ArgumentParser(
@@ -372,6 +754,11 @@ def main():
     overview_parser = subparsers.add_parser("overview", help="프로젝트 개요를 표시합니다")
     overview_parser.add_argument("-p", "--path", default=".", help="프로젝트 경로")
 
+    # plan 명령어
+    plan_parser = subparsers.add_parser("plan", help="Plan Mode - 기획/설계 단계를 실행합니다")
+    plan_parser.add_argument("goal", help="구현할 기능 요구사항")
+    plan_parser.add_argument("-v", "--verbose", action="store_true", help="상세 출력")
+
     args = parser.parse_args()
 
     # Ctrl+C 핸들링
@@ -383,6 +770,9 @@ def main():
         cmd_search(args)
     elif args.command == "overview":
         cmd_overview(args)
+    elif args.command == "plan":
+        print_header()
+        cmd_plan(args)
     elif args.command == "run":
         if args.goal and not args.interactive:
             print_header()

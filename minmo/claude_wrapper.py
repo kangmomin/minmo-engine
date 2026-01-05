@@ -331,7 +331,7 @@ class ClaudeCodeWrapper:
         try:
             if sys.platform == "win32":
                 # Windows: PopenSpawn 사용
-                process = PopenSpawn(
+                process = PexpectSpawn(
                     " ".join(f'"{arg}"' if " " in arg else arg for arg in cmd_args),
                     encoding=PEXPECT_ENCODING,
                     timeout=self.timeout_seconds,

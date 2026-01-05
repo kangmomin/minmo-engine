@@ -110,6 +110,72 @@ class TaskPlan:
 
 
 # ============================================================
+# Plan Mode 데이터 클래스
+# ============================================================
+class InterviewFocus(Enum):
+    """인터뷰 질문 초점 영역"""
+    ARCHITECTURE = "architecture"
+    DATA_MODEL = "data_model"
+    EXCEPTION_HANDLING = "exception_handling"
+    CONVENTION = "convention"
+    INTEGRATION = "integration"
+    TESTING = "testing"
+
+
+@dataclass
+class InterviewQuestion:
+    """Speckit 스타일 심층 인터뷰 질문"""
+    question: str
+    focus: InterviewFocus
+    options: list[str] = field(default_factory=list)
+    context: str = ""
+    follow_up_hint: str = ""
+
+
+@dataclass
+class InterviewAnswer:
+    """인터뷰 답변"""
+    question: InterviewQuestion
+    answer: str
+
+
+@dataclass
+class FeatureSpec:
+    """기획서 (Feature Specification)"""
+    feature_name: str
+    summary: str
+    requirements: list[str] = field(default_factory=list)
+    architecture_decisions: list[str] = field(default_factory=list)
+    data_model: dict[str, Any] = field(default_factory=dict)
+    error_handling: list[str] = field(default_factory=list)
+    conventions: list[str] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
+    out_of_scope: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PlanTask:
+    """상세 작업 (Plan Mode Task)"""
+    id: str
+    title: str
+    goal: str
+    files_to_modify: list[str] = field(default_factory=list)
+    expected_logic: str = ""
+    dependencies: list[str] = field(default_factory=list)
+    acceptance_criteria: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PlanModeResult:
+    """Plan Mode 결과"""
+    feature_spec: FeatureSpec
+    tasks: list[PlanTask] = field(default_factory=list)
+    interview_history: list[InterviewAnswer] = field(default_factory=list)
+    approved: bool = False
+    spec_file_path: str = ""
+
+
+# ============================================================
 # Gemini Wrapper 클래스
 # ============================================================
 class GeminiWrapper:
@@ -684,3 +750,495 @@ class GeminiWrapper:
         """대화를 초기화합니다."""
         self.chat = self.model.start_chat(history=[])
         self._log("대화 초기화")
+
+    # ============================================================
+    # Plan Mode 메서드
+    # ============================================================
+
+    def generate_interview_questions(
+        self,
+        user_goal: str,
+        project_context: dict[str, Any] | None = None,
+        existing_conventions: list[str] | None = None
+    ) -> list[InterviewQuestion]:
+        """
+        사용자 목표를 분석하여 Speckit 스타일 심층 질문을 생성합니다.
+
+        Args:
+            user_goal: 사용자의 요구사항/목표
+            project_context: 프로젝트 컨텍스트 (언어, 프레임워크 등)
+            existing_conventions: 기존 프로젝트 컨벤션 목록
+
+        Returns:
+            3-7개의 심층 질문 목록
+        """
+        self._log("인터뷰 질문 생성 시작", {"goal": user_goal})
+
+        conventions_info = ""
+        if existing_conventions:
+            conventions_info = f"""
+**기존 프로젝트 컨벤션:**
+{chr(10).join(f"- {c}" for c in existing_conventions)}
+"""
+
+        prompt = f"""
+사용자의 요구사항을 분석하고, 구현 전 반드시 명확화해야 할 심층 질문을 생성해주세요.
+
+**사용자 요구사항:** {user_goal}
+
+**프로젝트 컨텍스트:**
+{json.dumps(project_context, indent=2, ensure_ascii=False) if project_context else "없음"}
+
+{conventions_info}
+
+**질문 생성 규칙:**
+1. 최소 3개, 최대 7개의 질문을 생성합니다.
+2. 각 질문은 다음 영역 중 하나에 초점을 맞춥니다:
+   - architecture: 전체 구조, 컴포넌트 관계, 레이어 분리
+   - data_model: 데이터 구조, 스키마, 타입 정의
+   - exception_handling: 에러 처리, 실패 시나리오, 복구 전략
+   - convention: 기존 컨벤션 준수, 네이밍, 코드 스타일
+   - integration: 외부 시스템 연동, API 설계
+   - testing: 테스트 전략, 커버리지 목표
+3. 추측하지 말고 불확실한 부분을 질문합니다.
+4. 각 질문에는 선택 가능한 옵션을 제공합니다 (2-4개).
+
+다음 JSON 형식으로 응답해주세요:
+```json
+{{
+  "type": "interview_questions",
+  "content": {{
+    "questions": [
+      {{
+        "question": "구체적인 질문 내용",
+        "focus": "architecture|data_model|exception_handling|convention|integration|testing",
+        "options": ["옵션1", "옵션2", "옵션3", "직접 입력"],
+        "context": "이 질문을 하는 이유와 배경",
+        "follow_up_hint": "답변에 따라 추가로 확인할 수 있는 사항"
+      }}
+    ]
+  }}
+}}
+```
+"""
+
+        response = self._send_message(prompt)
+        parsed = self._parse_json_response(response)
+
+        content = parsed.get("content", {})
+        raw_questions = content.get("questions", [])
+
+        questions = []
+        for q in raw_questions:
+            try:
+                focus = InterviewFocus(q.get("focus", "architecture"))
+            except ValueError:
+                focus = InterviewFocus.ARCHITECTURE
+
+            questions.append(InterviewQuestion(
+                question=q.get("question", ""),
+                focus=focus,
+                options=q.get("options", []),
+                context=q.get("context", ""),
+                follow_up_hint=q.get("follow_up_hint", "")
+            ))
+
+        self._log("인터뷰 질문 생성 완료", {"count": len(questions)})
+        return questions
+
+    def generate_feature_spec(
+        self,
+        user_goal: str,
+        interview_answers: list[InterviewAnswer],
+        project_context: dict[str, Any] | None = None
+    ) -> FeatureSpec:
+        """
+        인터뷰 답변을 기반으로 기획서를 생성합니다.
+
+        Args:
+            user_goal: 원래 사용자 목표
+            interview_answers: 인터뷰 질문과 답변 목록
+            project_context: 프로젝트 컨텍스트
+
+        Returns:
+            FeatureSpec: 기획서
+        """
+        self._log("기획서 생성 시작", {"goal": user_goal})
+
+        # 인터뷰 내용 정리
+        qa_list = []
+        for ia in interview_answers:
+            qa_list.append({
+                "question": ia.question.question,
+                "focus": ia.question.focus.value,
+                "answer": ia.answer
+            })
+
+        prompt = f"""
+인터뷰 결과를 바탕으로 기능 기획서를 작성해주세요.
+
+**원래 요구사항:** {user_goal}
+
+**인터뷰 질문과 답변:**
+{json.dumps(qa_list, indent=2, ensure_ascii=False)}
+
+**프로젝트 컨텍스트:**
+{json.dumps(project_context, indent=2, ensure_ascii=False) if project_context else "없음"}
+
+다음 JSON 형식으로 기획서를 작성해주세요:
+```json
+{{
+  "type": "feature_spec",
+  "content": {{
+    "feature_name": "기능명 (영문, snake_case)",
+    "summary": "기능 요약 (1-2문장)",
+    "requirements": [
+      "구체적인 요구사항 1",
+      "구체적인 요구사항 2"
+    ],
+    "architecture_decisions": [
+      "아키텍처 결정 사항 1 (이유 포함)",
+      "아키텍처 결정 사항 2"
+    ],
+    "data_model": {{
+      "entities": ["엔티티1", "엔티티2"],
+      "relationships": ["관계 설명"],
+      "schema_notes": "스키마 관련 노트"
+    }},
+    "error_handling": [
+      "에러 시나리오 1: 처리 방법",
+      "에러 시나리오 2: 처리 방법"
+    ],
+    "conventions": [
+      "준수할 컨벤션 1",
+      "준수할 컨벤션 2"
+    ],
+    "constraints": [
+      "제약 조건 1",
+      "제약 조건 2"
+    ],
+    "out_of_scope": [
+      "이번 구현에서 제외할 것 1",
+      "제외할 것 2"
+    ]
+  }}
+}}
+```
+
+**작성 규칙:**
+- 인터뷰에서 확인된 내용만 포함합니다.
+- 추측하거나 가정한 내용은 포함하지 않습니다.
+- 명확하게 합의되지 않은 부분은 constraints에 명시합니다.
+"""
+
+        response = self._send_message(prompt)
+        parsed = self._parse_json_response(response)
+
+        content = parsed.get("content", {})
+
+        spec = FeatureSpec(
+            feature_name=content.get("feature_name", "unnamed_feature"),
+            summary=content.get("summary", ""),
+            requirements=content.get("requirements", []),
+            architecture_decisions=content.get("architecture_decisions", []),
+            data_model=content.get("data_model", {}),
+            error_handling=content.get("error_handling", []),
+            conventions=content.get("conventions", []),
+            constraints=content.get("constraints", []),
+            out_of_scope=content.get("out_of_scope", [])
+        )
+
+        self._log("기획서 생성 완료", {"feature": spec.feature_name})
+        return spec
+
+    def decompose_to_tasks(
+        self,
+        spec: FeatureSpec,
+        project_context: dict[str, Any] | None = None
+    ) -> list[PlanTask]:
+        """
+        기획서를 구체적인 Task 리스트로 분해합니다.
+
+        Args:
+            spec: 기능 기획서
+            project_context: 프로젝트 컨텍스트
+
+        Returns:
+            PlanTask 목록 (각 Task는 목표, 수정할 파일, 예상 로직 포함)
+        """
+        self._log("태스크 분해 시작", {"feature": spec.feature_name})
+
+        spec_dict = {
+            "feature_name": spec.feature_name,
+            "summary": spec.summary,
+            "requirements": spec.requirements,
+            "architecture_decisions": spec.architecture_decisions,
+            "data_model": spec.data_model,
+            "error_handling": spec.error_handling,
+            "conventions": spec.conventions,
+            "constraints": spec.constraints
+        }
+
+        prompt = f"""
+기획서를 구체적인 작업 태스크로 분해해주세요.
+
+**기획서:**
+{json.dumps(spec_dict, indent=2, ensure_ascii=False)}
+
+**프로젝트 컨텍스트:**
+{json.dumps(project_context, indent=2, ensure_ascii=False) if project_context else "없음"}
+
+다음 JSON 형식으로 태스크를 분해해주세요:
+```json
+{{
+  "type": "task_decomposition",
+  "content": {{
+    "tasks": [
+      {{
+        "id": "task_001",
+        "title": "작업 제목",
+        "goal": "이 작업이 달성해야 할 구체적인 목표",
+        "files_to_modify": [
+          "수정할 파일 경로 1",
+          "새로 생성할 파일 경로 2"
+        ],
+        "expected_logic": "예상되는 구현 로직 설명 (상세히)",
+        "dependencies": ["선행 작업 ID"],
+        "acceptance_criteria": [
+          "완료 조건 1",
+          "완료 조건 2"
+        ]
+      }}
+    ]
+  }}
+}}
+```
+
+**분해 규칙:**
+1. 각 태스크는 독립적으로 실행 가능해야 합니다.
+2. 태스크 크기는 코드 50-150줄 수준으로 분해합니다.
+3. 파일 경로는 구체적으로 명시합니다.
+4. expected_logic은 실제 구현에 필요한 정보를 상세히 기술합니다.
+5. acceptance_criteria는 테스트 가능한 조건으로 작성합니다.
+6. 불필요한 태스크를 추가하지 않습니다.
+"""
+
+        response = self._send_message(prompt)
+        parsed = self._parse_json_response(response)
+
+        content = parsed.get("content", {})
+        raw_tasks = content.get("tasks", [])
+
+        tasks = []
+        for t in raw_tasks:
+            tasks.append(PlanTask(
+                id=t.get("id", f"task_{len(tasks)+1:03d}"),
+                title=t.get("title", ""),
+                goal=t.get("goal", ""),
+                files_to_modify=t.get("files_to_modify", []),
+                expected_logic=t.get("expected_logic", ""),
+                dependencies=t.get("dependencies", []),
+                acceptance_criteria=t.get("acceptance_criteria", [])
+            ))
+
+        self._log("태스크 분해 완료", {"count": len(tasks)})
+        return tasks
+
+    def validate_against_conventions(
+        self,
+        tasks: list[PlanTask],
+        existing_conventions: list[str],
+        architecture_info: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """
+        태스크가 기존 컨벤션과 아키텍처를 위반하지 않는지 검증합니다.
+
+        Args:
+            tasks: 검증할 태스크 목록
+            existing_conventions: 기존 컨벤션 목록
+            architecture_info: 기존 아키텍처 정보
+
+        Returns:
+            검증 결과 (violations, warnings, approved)
+        """
+        self._log("컨벤션 검증 시작", {"task_count": len(tasks)})
+
+        tasks_summary = []
+        for t in tasks:
+            tasks_summary.append({
+                "id": t.id,
+                "title": t.title,
+                "files": t.files_to_modify,
+                "logic": t.expected_logic
+            })
+
+        prompt = f"""
+제안된 태스크들이 기존 프로젝트 컨벤션과 아키텍처를 준수하는지 검증해주세요.
+
+**태스크 목록:**
+{json.dumps(tasks_summary, indent=2, ensure_ascii=False)}
+
+**기존 컨벤션:**
+{chr(10).join(f"- {c}" for c in existing_conventions) if existing_conventions else "없음"}
+
+**아키텍처 정보:**
+{json.dumps(architecture_info, indent=2, ensure_ascii=False) if architecture_info else "없음"}
+
+다음 JSON 형식으로 검증 결과를 반환해주세요:
+```json
+{{
+  "type": "convention_validation",
+  "content": {{
+    "approved": true|false,
+    "violations": [
+      {{
+        "task_id": "위반 태스크 ID",
+        "violation": "위반 내용",
+        "convention": "위반한 컨벤션",
+        "severity": "error|warning",
+        "suggestion": "수정 제안"
+      }}
+    ],
+    "warnings": [
+      "경고 메시지 1",
+      "경고 메시지 2"
+    ],
+    "recommendations": [
+      "권장 사항 1",
+      "권장 사항 2"
+    ]
+  }}
+}}
+```
+
+**검증 기준:**
+- 파일 구조가 기존 패턴을 따르는지
+- 네이밍 컨벤션을 준수하는지
+- 레이어 분리가 올바른지
+- 기존 패턴과 일관성이 있는지
+"""
+
+        response = self._send_message(prompt)
+        parsed = self._parse_json_response(response)
+
+        content = parsed.get("content", {})
+
+        self._log("컨벤션 검증 완료", {
+            "approved": content.get("approved", False),
+            "violations": len(content.get("violations", []))
+        })
+
+        return content
+
+    def run_plan_mode(
+        self,
+        user_goal: str,
+        project_context: dict[str, Any] | None = None,
+        existing_conventions: list[str] | None = None,
+        architecture_info: dict[str, Any] | None = None,
+        on_question: Callable[[InterviewQuestion], str] | None = None,
+        on_spec_review: Callable[[FeatureSpec], bool] | None = None,
+        on_tasks_review: Callable[[list[PlanTask]], bool] | None = None
+    ) -> PlanModeResult:
+        """
+        Plan Mode 전체 흐름을 실행합니다.
+
+        1. 심층 인터뷰 질문 생성 및 수집
+        2. 기획서 생성
+        3. 태스크 분해
+        4. 컨벤션 검증
+        5. 사용자 승인
+
+        Args:
+            user_goal: 사용자 요구사항
+            project_context: 프로젝트 컨텍스트
+            existing_conventions: 기존 컨벤션 목록
+            architecture_info: 아키텍처 정보
+            on_question: 질문 콜백 (질문 → 답변)
+            on_spec_review: 기획서 리뷰 콜백 (기획서 → 승인여부)
+            on_tasks_review: 태스크 리뷰 콜백 (태스크 목록 → 승인여부)
+
+        Returns:
+            PlanModeResult: Plan Mode 결과
+        """
+        self._log("Plan Mode 시작", {"goal": user_goal})
+
+        # 1. 인터뷰 질문 생성
+        questions = self.generate_interview_questions(
+            user_goal=user_goal,
+            project_context=project_context,
+            existing_conventions=existing_conventions
+        )
+
+        # 2. 인터뷰 수행
+        interview_answers: list[InterviewAnswer] = []
+        for q in questions:
+            if on_question:
+                answer = on_question(q)
+            else:
+                # 콜백이 없으면 첫 번째 옵션 선택 (테스트용)
+                answer = q.options[0] if q.options else "확인"
+
+            interview_answers.append(InterviewAnswer(question=q, answer=answer))
+
+        # 3. 기획서 생성
+        spec = self.generate_feature_spec(
+            user_goal=user_goal,
+            interview_answers=interview_answers,
+            project_context=project_context
+        )
+
+        # 4. 기획서 리뷰
+        spec_approved = True
+        if on_spec_review:
+            spec_approved = on_spec_review(spec)
+
+        if not spec_approved:
+            self._log("기획서 미승인으로 Plan Mode 종료")
+            return PlanModeResult(
+                feature_spec=spec,
+                interview_history=interview_answers,
+                approved=False
+            )
+
+        # 5. 태스크 분해
+        tasks = self.decompose_to_tasks(
+            spec=spec,
+            project_context=project_context
+        )
+
+        # 6. 컨벤션 검증
+        if existing_conventions:
+            validation = self.validate_against_conventions(
+                tasks=tasks,
+                existing_conventions=existing_conventions,
+                architecture_info=architecture_info
+            )
+
+            if not validation.get("approved", True):
+                self._log("컨벤션 위반으로 Plan Mode 종료", validation)
+                return PlanModeResult(
+                    feature_spec=spec,
+                    tasks=tasks,
+                    interview_history=interview_answers,
+                    approved=False
+                )
+
+        # 7. 태스크 리뷰
+        tasks_approved = True
+        if on_tasks_review:
+            tasks_approved = on_tasks_review(tasks)
+
+        result = PlanModeResult(
+            feature_spec=spec,
+            tasks=tasks,
+            interview_history=interview_answers,
+            approved=tasks_approved
+        )
+
+        self._log("Plan Mode 완료", {
+            "approved": tasks_approved,
+            "task_count": len(tasks)
+        })
+
+        return result
