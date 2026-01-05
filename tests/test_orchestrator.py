@@ -175,14 +175,12 @@ class TestMinmoOrchestrator:
         error_cb = MagicMock()
 
         orchestrator = MinmoOrchestrator(
-            gemini_api_key="test-key",
             working_directory="/test/dir",
             on_output=output_cb,
             on_error=error_cb,
             verbose=True,
         )
 
-        assert orchestrator._gemini_api_key == "test-key"
         assert orchestrator._working_directory == "/test/dir"
         assert orchestrator._verbose is True
 
@@ -476,7 +474,6 @@ class TestIntegration:
 
     def test_full_orchestration_flow(self, mock_deps):
         orchestrator = MinmoOrchestrator(
-            gemini_api_key="test-key",
             working_directory="/test",
         )
 

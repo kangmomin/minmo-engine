@@ -282,15 +282,16 @@ class TestGeminiCLIWrapper:
         wrapper.close()
 
     def test_find_gemini_cli_not_found(self, mock_scribe):
-        """Test when gemini CLI is not found."""
+        """Test when gemini CLI is not found raises RuntimeError."""
         with patch("shutil.which") as mock_which:
             mock_which.return_value = None
             with patch("os.path.exists") as mock_exists:
                 mock_exists.return_value = False
-                wrapper = GeminiCLIWrapper()
-                # Should return default command name
-                assert "gemini" in wrapper.gemini_path
-                wrapper.close()
+                with pytest.raises(RuntimeError) as excinfo:
+                    GeminiCLIWrapper()
+                # Should contain installation instructions
+                assert "npm install -g @google/gemini-cli" in str(excinfo.value)
+                assert "gemini login" in str(excinfo.value)
 
     def test_check_login_status_success(self, wrapper, mock_scribe):
         """Test successful login status check."""

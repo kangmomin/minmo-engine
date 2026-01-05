@@ -198,7 +198,12 @@ class GeminiCLIWrapper:
             pass
 
     def _find_gemini_cli(self) -> str:
-        """Gemini CLI 실행 파일을 찾습니다."""
+        """
+        Gemini CLI 실행 파일을 찾습니다.
+
+        Raises:
+            RuntimeError: Gemini CLI가 설치되어 있지 않은 경우
+        """
         # 환경변수에서 먼저 확인
         gemini_path = os.environ.get("GEMINI_CLI_PATH")
         if gemini_path and os.path.exists(gemini_path):
@@ -227,8 +232,19 @@ class GeminiCLIWrapper:
             if os.path.exists(path):
                 return path
 
-        # 찾지 못한 경우 기본값 반환
-        return gemini_cmd
+        # CLI를 찾지 못한 경우 친절한 안내 메시지와 함께 예외 발생
+        raise RuntimeError(
+            "\n"
+            "Gemini CLI를 찾을 수 없습니다.\n"
+            "\n"
+            "다음 명령어로 Gemini CLI를 설치해주세요:\n"
+            "  npm install -g @google/gemini-cli\n"
+            "\n"
+            "설치 후 로그인해주세요:\n"
+            "  gemini login\n"
+            "\n"
+            "또는 GEMINI_CLI_PATH 환경변수로 경로를 직접 지정할 수 있습니다."
+        )
 
     def _log(self, content: str, metadata: dict | None = None) -> None:
         """Scribe를 통해 로그를 기록합니다."""

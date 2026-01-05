@@ -116,7 +116,6 @@ class MinmoOrchestrator:
 
     def __init__(
         self,
-        gemini_api_key: str | None = None,
         working_directory: str | None = None,
         on_output: Callable[[str], None] | None = None,
         on_error: Callable[[str, dict], None] | None = None,
@@ -126,7 +125,6 @@ class MinmoOrchestrator:
         오케스트레이터 초기화
 
         Args:
-            gemini_api_key: Gemini API 키 (없으면 환경변수 사용)
             working_directory: 작업 디렉토리
             on_output: 출력 콜백
             on_error: 에러 콜백
@@ -136,7 +134,6 @@ class MinmoOrchestrator:
         self.commander: GeminiWrapper | None = None
         self.worker: ClaudeCodeWrapper | None = None
         self._is_complete = False
-        self._gemini_api_key = gemini_api_key
         self._working_directory = working_directory
         self._on_output = on_output
         self._on_error = on_error
@@ -145,7 +142,10 @@ class MinmoOrchestrator:
     def _ensure_commander(self) -> GeminiWrapper:
         """Commander(Gemini)가 초기화되었는지 확인하고 반환합니다."""
         if self.commander is None:
-            self.commander = GeminiWrapper(api_key=self._gemini_api_key)
+            self.commander = GeminiWrapper(
+                working_directory=self._working_directory,
+                verbose=self._verbose
+            )
         return self.commander
 
     def _ensure_worker(self) -> ClaudeCodeWrapper:
