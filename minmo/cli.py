@@ -22,12 +22,13 @@ from rich import box
 from minmo import __version__
 from minmo.orchestrator import MinmoOrchestrator
 from minmo.indexer import CodeIndexer
-from minmo.gemini_wrapper import (
-    GeminiWrapper,
+from minmo.gemini_cli_wrapper import (
+    GeminiCLIWrapper,
     InterviewQuestion,
     FeatureSpec,
     PlanTask,
-    PlanModeResult
+    PlanModeResult,
+    ProjectAnalysis,
 )
 from minmo.scribe_mcp import get_conventions, get_architecture_info, save_feature_spec
 
@@ -583,14 +584,75 @@ def _generate_spec_markdown(spec: FeatureSpec, result: PlanModeResult) -> str:
     return "\n".join(lines)
 
 
+def _display_project_analysis(analysis: ProjectAnalysis):
+    """프로젝트 분석 결과를 표시합니다."""
+    console.print(Panel(
+        f"[bold]프로젝트 분석 결과[/bold]\n\n"
+        f"[dim]경로: {analysis.project_path}[/dim]",
+        title="[cyan]Gemini CLI 분석[/cyan]",
+        box=box.ROUNDED,
+        border_style="cyan"
+    ))
+
+    if analysis.languages:
+        console.print(f"\n[bold]언어:[/bold] {', '.join(analysis.languages)}")
+
+    if analysis.frameworks:
+        console.print(f"[bold]프레임워크:[/bold] {', '.join(analysis.frameworks)}")
+
+    if analysis.structure_summary:
+        console.print(f"[bold]구조:[/bold] {analysis.structure_summary}")
+
+    if analysis.conventions:
+        console.print("\n[bold]감지된 컨벤션:[/bold]")
+        for conv in analysis.conventions:
+            console.print(f"  • [dim]{conv}[/dim]")
+
+    if analysis.key_files:
+        console.print("\n[bold]주요 파일:[/bold]")
+        for f in analysis.key_files[:5]:
+            console.print(f"  • [dim]{f}[/dim]")
+
+    console.print()
+
+
+def _wait_for_approve() -> bool:
+    """사용자에게 'approve' 입력을 받습니다."""
+    console.print(Panel(
+        "[bold yellow]승인 대기 중[/bold yellow]\n\n"
+        "[dim]위 태스크 목록을 검토한 후[/dim]\n"
+        "[bold]'approve'[/bold][dim]를 입력하면 다음 단계로 진행합니다.[/dim]\n"
+        "[dim]취소하려면 'cancel' 또는 Ctrl+C를 입력하세요.[/dim]",
+        box=box.DOUBLE,
+        border_style="yellow"
+    ))
+
+    while True:
+        try:
+            user_input = console.input("\n[bold cyan]>>> [/bold cyan]").strip().lower()
+
+            if user_input == "approve":
+                console.print("[green]승인되었습니다.[/green]")
+                return True
+            elif user_input in ("cancel", "exit", "quit", "n", "no"):
+                console.print("[yellow]취소되었습니다.[/yellow]")
+                return False
+            else:
+                console.print("[dim]'approve' 또는 'cancel'을 입력하세요.[/dim]")
+
+        except KeyboardInterrupt:
+            console.print("\n[yellow]취소되었습니다.[/yellow]")
+            return False
+
+
 def cmd_plan(args):
-    """Plan Mode - 기획/설계 단계를 실행합니다."""
+    """Plan Mode - Gemini CLI 기반 기획/설계 단계를 실행합니다."""
     goal = args.goal
 
     console.print(Panel(
-        f"[bold cyan]Plan Mode[/bold cyan]\n\n"
-        f"[dim]요구사항을 분석하고 기획서를 생성합니다.[/dim]\n"
-        f"[dim]승인 전까지 실제 작업은 시작되지 않습니다.[/dim]",
+        f"[bold cyan]Plan Mode (Gemini CLI)[/bold cyan]\n\n"
+        f"[dim]Gemini CLI가 프로젝트를 분석하고 인터뷰를 진행합니다.[/dim]\n"
+        f"[dim]'approve' 입력 전까지 실제 작업은 시작되지 않습니다.[/dim]",
         box=box.DOUBLE,
         border_style="cyan"
     ))
@@ -599,76 +661,105 @@ def cmd_plan(args):
     console.print(f"[bold]목표:[/bold] {goal}")
     console.print()
 
+    commander = None
+
     try:
-        # 1. 프로젝트 컨텍스트 수집
+        # 1. Gemini CLI Wrapper 초기화
+        console.print("[dim]Gemini CLI 세션 시작 중...[/dim]")
+
+        try:
+            commander = GeminiCLIWrapper(
+                verbose=args.verbose,
+                on_output=lambda x: console.print(f"[dim]{x}[/dim]") if args.verbose else None
+            )
+
+            # 로그인 상태 확인
+            if not commander.check_login_status():
+                console.print("[yellow]경고: Gemini CLI가 설치되지 않았거나 로그인되지 않았습니다.[/yellow]")
+                console.print("[dim]'npm install -g @google/gemini-cli && gemini login'을 실행하세요.[/dim]")
+                return
+
+        except Exception as e:
+            console.print(f"[red]Gemini CLI 초기화 오류: {e}[/red]")
+            console.print("[dim]Gemini CLI가 설치되어 있는지 확인하세요.[/dim]")
+            return
+
+        # 2. 프로젝트 분석
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             console=console,
             transient=True
         ) as progress:
-            task = progress.add_task("프로젝트 분석 중...", total=None)
+            task = progress.add_task("Gemini CLI로 프로젝트 분석 중...", total=None)
 
-            project_context = {}
-            existing_conventions = []
-            architecture_info = None
-
-            # 컨벤션 조회
             try:
-                conv_result = get_conventions()
-                if conv_result.get("success"):
-                    existing_conventions = conv_result.get("conventions", [])
-                    project_context["naming_patterns"] = conv_result.get("naming_patterns", {})
-            except Exception:
-                pass
+                project_analysis = commander.analyze_project()
+                progress.update(task, description="[green]프로젝트 분석 완료[/green]")
+            except Exception as e:
+                progress.update(task, description="[yellow]프로젝트 분석 실패[/yellow]")
+                project_analysis = ProjectAnalysis(project_path=os.getcwd())
 
-            # 아키텍처 정보 조회
-            try:
-                arch_result = get_architecture_info()
-                if arch_result.get("success"):
-                    architecture_info = arch_result
-                    project_context["directories"] = arch_result.get("directories", [])
-                    project_context["layers"] = arch_result.get("layers", [])
-            except Exception:
-                pass
+        # 분석 결과 표시
+        _display_project_analysis(project_analysis)
 
-            progress.update(task, description="[green]프로젝트 분석 완료[/green]")
-
-        if existing_conventions:
-            console.print("[bold]감지된 컨벤션:[/bold]")
-            for conv in existing_conventions:
-                console.print(f"  • [dim]{conv}[/dim]")
-            console.print()
-
-        # 2. GeminiWrapper 초기화
-        try:
-            commander = GeminiWrapper()
-        except ValueError as e:
-            console.print(f"[red]오류: {e}[/red]")
-            console.print("[dim]GEMINI_API_KEY 환경변수를 설정해주세요.[/dim]")
-            return
-
-        # 3. Plan Mode 실행
+        # 3. 인터뷰 시작
         console.print(Panel(
-            "[bold]인터뷰를 시작합니다[/bold]\n\n"
-            "[dim]아키텍처, 데이터 모델, 예외 처리, 컨벤션에 대한 질문에 답해주세요.[/dim]",
+            "[bold]Speckit 인터뷰를 시작합니다[/bold]\n\n"
+            "[dim]Gemini CLI가 아키텍처, 데이터 모델, 예외 처리, 컨벤션에 대해 질문합니다.[/dim]",
             box=box.ROUNDED,
             border_style="yellow"
         ))
         console.print()
 
+        # 4. Plan Mode 실행
         result = commander.run_plan_mode(
             user_goal=goal,
-            project_context=project_context,
-            existing_conventions=existing_conventions,
-            architecture_info=architecture_info,
             on_question=_ask_interview_question,
             on_spec_review=_review_spec,
-            on_tasks_review=_review_tasks
+            on_tasks_review=None  # 별도의 approve 워크플로우 사용
         )
 
-        # 4. 결과 처리
-        if result.approved:
+        # 분석 결과 저장
+        result.project_analysis = project_analysis
+
+        # 5. 태스크 목록 표시 (승인 대기 전)
+        if result.tasks:
+            console.print(Panel(
+                f"[bold]총 {len(result.tasks)}개 태스크 생성됨[/bold]",
+                title="[cyan]태스크 목록[/cyan]",
+                box=box.ROUNDED,
+                border_style="cyan"
+            ))
+
+            for i, task in enumerate(result.tasks, 1):
+                tree = Tree(f"[bold cyan]{i}. {task.title}[/bold cyan] ({task.id})")
+                tree.add(f"[bold]목표:[/bold] {task.goal}")
+
+                if task.files_to_modify:
+                    files_branch = tree.add("[bold]수정 파일:[/bold]")
+                    for f in task.files_to_modify:
+                        files_branch.add(f"[dim]{f}[/dim]")
+
+                if task.expected_logic:
+                    logic_preview = task.expected_logic[:150]
+                    if len(task.expected_logic) > 150:
+                        logic_preview += "..."
+                    tree.add(f"[bold]예상 로직:[/bold] {logic_preview}")
+
+                if task.acceptance_criteria:
+                    criteria_branch = tree.add("[bold]완료 조건:[/bold]")
+                    for c in task.acceptance_criteria:
+                        criteria_branch.add(f"[dim]✓ {c}[/dim]")
+
+                console.print(tree)
+                console.print()
+
+        # 6. 승인 대기 (approve 입력 필요)
+        result.approved = _wait_for_approve()
+
+        # 7. 결과 처리
+        if result.approved and result.feature_spec:
             console.print(Panel(
                 "[bold green]Plan Mode 완료 - 승인됨[/bold green]\n\n"
                 f"기획서: {result.feature_spec.feature_name}\n"
@@ -677,18 +768,36 @@ def cmd_plan(args):
                 border_style="green"
             ))
 
-            # 기획서 저장
+            # 기획서를 specs/ 디렉토리에 저장
             spec_content = _generate_spec_markdown(result.feature_spec, result)
-            save_result = save_feature_spec(
-                feature_name=result.feature_spec.feature_name,
-                content=spec_content
-            )
 
-            if save_result.get("success"):
-                console.print(f"\n[green]기획서 저장 완료:[/green] {save_result['file_path']}")
-                result.spec_file_path = save_result['file_path']
-            else:
-                console.print(f"[yellow]기획서 저장 실패: {save_result.get('error')}[/yellow]")
+            # save_feature_spec 함수 직접 호출 (MCP 도구가 아닌 직접 구현)
+            try:
+                from pathlib import Path
+                spec_dir = Path.cwd() / "specs"
+                spec_dir.mkdir(parents=True, exist_ok=True)
+                spec_file = spec_dir / f"{result.feature_spec.feature_name}.md"
+                spec_file.write_text(spec_content, encoding="utf-8")
+
+                console.print(f"\n[green]기획서 저장 완료:[/green] {spec_file}")
+                result.spec_file_path = str(spec_file)
+            except Exception as e:
+                console.print(f"[yellow]기획서 저장 실패: {e}[/yellow]")
+
+            # Scribe를 통해 기록
+            try:
+                from minmo.scribe_mcp import log_event
+                log_event(
+                    agent="commander",
+                    content=f"Plan Mode 완료: {result.feature_spec.feature_name}",
+                    metadata=json.dumps({
+                        "feature_name": result.feature_spec.feature_name,
+                        "task_count": len(result.tasks),
+                        "spec_file": result.spec_file_path
+                    }, ensure_ascii=False)
+                )
+            except Exception:
+                pass
 
             # 실행 여부 확인
             console.print()
@@ -697,14 +806,14 @@ def cmd_plan(args):
             if execute in ('y', 'yes'):
                 console.print("\n[cyan]작업 실행을 시작합니다...[/cyan]\n")
                 # TODO: 오케스트레이터로 태스크 실행
-                console.print("[yellow]태스크 실행 기능은 아직 구현 중입니다.[/yellow]")
+                console.print("[yellow]태스크 실행 기능은 추후 구현 예정입니다.[/yellow]")
             else:
                 console.print("\n[dim]'minmo run' 명령으로 나중에 실행할 수 있습니다.[/dim]")
 
         else:
             console.print(Panel(
                 "[bold yellow]Plan Mode 종료 - 미승인[/bold yellow]\n\n"
-                "[dim]기획서가 승인되지 않았습니다.[/dim]\n"
+                "[dim]태스크가 승인되지 않았습니다.[/dim]\n"
                 "[dim]요구사항을 수정하고 다시 시도해주세요.[/dim]",
                 box=box.ROUNDED,
                 border_style="yellow"
@@ -717,6 +826,13 @@ def cmd_plan(args):
         import traceback
         if args.verbose:
             traceback.print_exc()
+    finally:
+        # Gemini CLI 세션 정리
+        if commander:
+            try:
+                commander.close()
+            except Exception:
+                pass
 
 
 def main():
