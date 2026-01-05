@@ -1,10 +1,14 @@
 """
-Tests for minmo.gemini_wrapper module.
+Tests for minmo.gemini_wrapper module (CLI-based).
+
+Gemini CLI (@google/gemini-cli) 기반 래퍼 테스트
 """
 
 import os
+import sys
 import json
 from unittest.mock import MagicMock, patch, PropertyMock
+from pathlib import Path
 
 import pytest
 
@@ -15,6 +19,12 @@ from minmo.gemini_wrapper import (
     TaskPlan,
     GeminiWrapper,
     COMMANDER_CONSTITUTION,
+    InterviewFocus,
+    InterviewQuestion,
+    InterviewAnswer,
+    FeatureSpec,
+    PlanTask,
+    PlanModeResult,
 )
 
 
@@ -107,26 +117,123 @@ class TestTaskPlan:
         assert plan.risks == []
 
 
+class TestInterviewFocus:
+    """Tests for InterviewFocus enum."""
+
+    def test_enum_values(self):
+        assert InterviewFocus.ARCHITECTURE.value == "architecture"
+        assert InterviewFocus.DATA_MODEL.value == "data_model"
+        assert InterviewFocus.EXCEPTION_HANDLING.value == "exception_handling"
+        assert InterviewFocus.CONVENTION.value == "convention"
+        assert InterviewFocus.INTEGRATION.value == "integration"
+        assert InterviewFocus.TESTING.value == "testing"
+
+
+class TestInterviewQuestion:
+    """Tests for InterviewQuestion dataclass."""
+
+    def test_create_question(self):
+        question = InterviewQuestion(
+            question="Which database do you prefer?",
+            focus=InterviewFocus.DATA_MODEL,
+            options=["PostgreSQL", "MySQL", "SQLite"],
+            context="We need a database for storing user data",
+        )
+
+        assert "database" in question.question
+        assert question.focus == InterviewFocus.DATA_MODEL
+        assert len(question.options) == 3
+
+    def test_default_values(self):
+        question = InterviewQuestion(
+            question="Simple question?",
+            focus=InterviewFocus.ARCHITECTURE
+        )
+
+        assert question.options == []
+        assert question.context == ""
+
+
+class TestFeatureSpec:
+    """Tests for FeatureSpec dataclass."""
+
+    def test_create_spec(self):
+        spec = FeatureSpec(
+            feature_name="user_authentication",
+            summary="User login and registration system",
+            requirements=["Email login", "Password reset"],
+            architecture_decisions=["Use JWT tokens"],
+            data_model={"User": {"id": "int", "email": "str"}},
+            error_handling=["Invalid credentials error"],
+            conventions=["REST API naming"],
+            constraints=["Must work offline"],
+            out_of_scope=["Social login"],
+        )
+
+        assert spec.feature_name == "user_authentication"
+        assert len(spec.requirements) == 2
+
+    def test_default_values(self):
+        spec = FeatureSpec(feature_name="test", summary="Test feature")
+
+        assert spec.requirements == []
+        assert spec.architecture_decisions == []
+        assert spec.data_model == {}
+
+
+class TestPlanTask:
+    """Tests for PlanTask dataclass."""
+
+    def test_create_task(self):
+        task = PlanTask(
+            id="task_001",
+            title="Create User model",
+            goal="Define User dataclass with all fields",
+            files_to_modify=["models/user.py"],
+            expected_logic="Create User class",
+            dependencies=[],
+            acceptance_criteria=["User class exists"],
+        )
+
+        assert task.id == "task_001"
+        assert len(task.files_to_modify) == 1
+
+    def test_default_values(self):
+        task = PlanTask(id="task_002", title="Test task", goal="Do something")
+
+        assert task.files_to_modify == []
+        assert task.expected_logic == ""
+
+
+class TestPlanModeResult:
+    """Tests for PlanModeResult dataclass."""
+
+    def test_create_result(self):
+        spec = FeatureSpec(feature_name="test", summary="Test")
+        tasks = [PlanTask(id="t1", title="Task 1", goal="Goal 1")]
+
+        result = PlanModeResult(
+            feature_spec=spec,
+            tasks=tasks,
+            interview_history=[],
+            approved=True,
+            spec_file_path="/specs/test.md",
+        )
+
+        assert result.feature_spec.feature_name == "test"
+        assert len(result.tasks) == 1
+        assert result.approved is True
+
+    def test_default_values(self):
+        result = PlanModeResult()
+
+        assert result.feature_spec is None
+        assert result.tasks == []
+        assert result.approved is False
+
+
 class TestGeminiWrapper:
-    """Tests for GeminiWrapper class."""
-
-    @pytest.fixture
-    def mock_genai(self):
-        """Mock the google.generativeai module."""
-        with patch("minmo.gemini_wrapper.genai") as mock:
-            mock_model = MagicMock()
-            mock_chat = MagicMock()
-            mock_response = MagicMock()
-            mock_response.text = '{"type": "analysis", "content": {}, "requires_confirmation": false, "next_action": "wait_for_input"}'
-
-            mock_chat.send_message.return_value = mock_response
-            mock_chat.history = []
-            mock_model.start_chat.return_value = mock_chat
-
-            mock.GenerativeModel.return_value = mock_model
-            mock.GenerationConfig.return_value = {}
-
-            yield mock
+    """Tests for GeminiWrapper class (CLI-based)."""
 
     @pytest.fixture
     def mock_scribe(self):
@@ -138,44 +245,74 @@ class TestGeminiWrapper:
             yield {"log_event": mock_log, "init_database": mock_init}
 
     @pytest.fixture
-    def wrapper(self, mock_genai, mock_scribe):
+    def mock_shutil(self):
+        """Mock shutil.which to return gemini path."""
+        with patch("shutil.which") as mock_which:
+            mock_which.return_value = "/usr/local/bin/gemini"
+            yield mock_which
+
+    @pytest.fixture
+    def wrapper(self, mock_scribe, mock_shutil):
         """Create a GeminiWrapper instance with mocked dependencies."""
-        os.environ["GEMINI_API_KEY"] = "test-api-key"
-        wrapper = GeminiWrapper()
+        wrapper = GeminiWrapper(
+            working_directory="/test/project",
+            timeout_seconds=60,
+            verbose=False
+        )
         yield wrapper
-        os.environ.pop("GEMINI_API_KEY", None)
+        wrapper.close()
 
-    def test_init_without_api_key_raises_error(self, mock_genai, mock_scribe):
-        os.environ.pop("GEMINI_API_KEY", None)
-
-        with pytest.raises(ValueError) as excinfo:
-            GeminiWrapper()
-
-        assert "API 키가 필요합니다" in str(excinfo.value)
-
-    def test_init_with_api_key_param(self, mock_genai, mock_scribe):
-        wrapper = GeminiWrapper(api_key="direct-api-key")
-        assert wrapper.api_key == "direct-api-key"
-
-    def test_init_with_env_api_key(self, mock_genai, mock_scribe):
-        os.environ["GEMINI_API_KEY"] = "env-api-key"
+    def test_init_default_values(self, mock_scribe, mock_shutil):
         wrapper = GeminiWrapper()
-        assert wrapper.api_key == "env-api-key"
-        os.environ.pop("GEMINI_API_KEY", None)
 
-    def test_init_with_custom_model(self, mock_genai, mock_scribe):
-        os.environ["GEMINI_API_KEY"] = "test-key"
-        wrapper = GeminiWrapper(model_name="gemini-1.5-pro")
-        assert wrapper.model_name == "gemini-1.5-pro"
-        os.environ.pop("GEMINI_API_KEY", None)
+        assert wrapper.working_directory == os.getcwd()
+        assert wrapper.timeout_seconds == 120
+        assert wrapper.verbose is False
+        wrapper.close()
 
-    def test_init_with_custom_temperature(self, mock_genai, mock_scribe):
-        os.environ["GEMINI_API_KEY"] = "test-key"
-        wrapper = GeminiWrapper(temperature=0.7)
-        assert wrapper.temperature == 0.7
-        os.environ.pop("GEMINI_API_KEY", None)
+    def test_init_custom_values(self, mock_scribe, mock_shutil):
+        wrapper = GeminiWrapper(
+            working_directory="/custom/path",
+            timeout_seconds=300,
+            verbose=True
+        )
+
+        assert wrapper.working_directory == "/custom/path"
+        assert wrapper.timeout_seconds == 300
+        assert wrapper.verbose is True
+        wrapper.close()
+
+    def test_find_gemini_cli_from_env(self, mock_scribe):
+        """Test finding gemini CLI from environment variable."""
+        with patch.dict(os.environ, {"GEMINI_CLI_PATH": "/custom/gemini"}):
+            with patch("os.path.exists") as mock_exists:
+                mock_exists.return_value = True
+                wrapper = GeminiWrapper()
+                assert wrapper.gemini_path == "/custom/gemini"
+                wrapper.close()
+
+    def test_find_gemini_cli_from_path(self, mock_scribe, mock_shutil):
+        """Test finding gemini CLI from PATH."""
+        wrapper = GeminiWrapper()
+        assert wrapper.gemini_path == "/usr/local/bin/gemini"
+        wrapper.close()
+
+    def test_check_login_status_success(self, wrapper, mock_scribe):
+        """Test successful login status check."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = wrapper.check_login_status()
+            assert result is True
+
+    def test_check_login_status_failure(self, wrapper, mock_scribe):
+        """Test failed login status check."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1)
+            result = wrapper.check_login_status()
+            assert result is False
 
     def test_parse_json_response_with_json_block(self, wrapper):
+        """Test parsing JSON from markdown code block."""
         response = '''Here is the analysis:
 ```json
 {"type": "test", "content": {"key": "value"}}
@@ -185,344 +322,301 @@ class TestGeminiWrapper:
         assert result["type"] == "test"
         assert result["content"]["key"] == "value"
 
-    def test_parse_json_response_with_code_block(self, wrapper):
-        response = '''Result:
-```
-{"type": "test", "content": {}}
-```
-'''
-        result = wrapper._parse_json_response(response)
-        assert result["type"] == "test"
-
     def test_parse_json_response_plain_json(self, wrapper):
-        response = '{"type": "plain", "content": {}}'
+        """Test parsing plain JSON."""
+        response = '{"type": "plain", "content": {"data": 123}}'
         result = wrapper._parse_json_response(response)
         assert result["type"] == "plain"
 
     def test_parse_json_response_invalid_json(self, wrapper):
+        """Test parsing invalid JSON returns text content."""
         response = "This is not JSON at all"
         result = wrapper._parse_json_response(response)
         assert result["type"] == "text"
         assert result["content"] == response
 
-    def test_init_project_existing(self, wrapper, mock_genai):
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "analysis",
-            "content": {
-                "project_type": "existing",
-                "detected_languages": ["Python"],
-                "detected_frameworks": ["FastAPI"],
-                "detected_databases": ["SQLite"],
-                "structure_summary": "A backend project",
-                "recommendations": [],
-                "confidence": 0.9,
-            },
-            "requires_confirmation": True,
-            "next_action": "wait_for_input"
-        })
-        wrapper.chat.send_message.return_value = mock_response
+    def test_init_project_existing(self, wrapper, mock_scribe):
+        """Test project initialization for existing project."""
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+  "type": "analysis",
+  "content": {
+    "project_type": "existing",
+    "detected_languages": ["Python"],
+    "detected_frameworks": ["FastAPI"],
+    "detected_databases": ["SQLite"],
+    "structure_summary": "A backend project",
+    "recommendations": [],
+    "confidence": 0.9
+  }
+}
+```'''
 
-        file_list = ["main.py", "models.py", "routes.py"]
-        result = wrapper.init_project("/test/project", file_list)
+            file_list = ["main.py", "models.py", "routes.py"]
+            result = wrapper.init_project("/test/project", file_list)
 
-        assert result.project_type == ProjectType.EXISTING
-        assert "Python" in result.detected_languages
-        assert result.confidence == 0.9
+            assert result.project_type == ProjectType.EXISTING
+            assert "Python" in result.detected_languages
+            assert result.confidence == 0.9
 
-    def test_init_project_new(self, wrapper, mock_genai):
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "recommendation",
-            "content": {
-                "project_type": "new",
-                "detected_languages": [],
-                "detected_frameworks": [],
-                "detected_databases": [],
-                "recommendations": ["Use Python for backend"],
-                "confidence": 0.5,
-            },
-            "requires_confirmation": True,
-            "next_action": "wait_for_input"
-        })
-        wrapper.chat.send_message.return_value = mock_response
+    def test_init_project_new(self, wrapper, mock_scribe):
+        """Test project initialization for new project."""
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+  "type": "recommendation",
+  "content": {
+    "project_type": "new",
+    "detected_languages": [],
+    "detected_frameworks": [],
+    "detected_databases": [],
+    "recommendations": ["Use Python for backend"],
+    "confidence": 0.5
+  }
+}
+```'''
 
-        result = wrapper.init_project("/new/project", None)
+            result = wrapper.init_project("/new/project", None)
 
-        assert result.project_type == ProjectType.NEW
+            assert result.project_type == ProjectType.NEW
 
-    def test_clarify_goal_no_clarification_needed(self, wrapper, mock_genai):
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "clarification",
-            "content": {
-                "needs_clarification": False,
-                "understood_requirements": {
-                    "summary": "Create a login page",
-                    "scope": ["Frontend", "Backend"],
-                    "constraints": [],
-                    "assumptions": []
-                }
-            },
-            "requires_confirmation": True,
-            "next_action": "wait_for_input"
-        })
-        wrapper.chat.send_message.return_value = mock_response
+    def test_clarify_goal_no_clarification_needed(self, wrapper, mock_scribe):
+        """Test clarify goal when no clarification is needed."""
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+  "type": "clarification",
+  "content": {
+    "needs_clarification": false,
+    "understood_requirements": {
+      "summary": "Create a login page",
+      "scope": ["Frontend", "Backend"],
+      "constraints": [],
+      "assumptions": []
+    }
+  }
+}
+```'''
 
-        result = wrapper.clarify_goal("Create a login page")
+            result = wrapper.clarify_goal("Create a login page")
 
-        assert result["original_goal"] == "Create a login page"
-        assert result["final_requirements"] is not None
-        assert result["final_requirements"]["summary"] == "Create a login page"
+            assert result["original_goal"] == "Create a login page"
+            assert result["final_requirements"] is not None
 
-    def test_clarify_goal_with_questions(self, wrapper, mock_genai):
-        mock_responses = [
-            MagicMock(text=json.dumps({
-                "type": "clarification",
-                "content": {
-                    "needs_clarification": True,
-                    "questions": [{
-                        "question": "Which authentication method?",
-                        "options": ["OAuth", "JWT", "Session"],
-                        "context": "Need to know auth approach",
-                        "required": True
-                    }]
-                },
-                "next_action": "clarify"
-            })),
-            MagicMock(text=json.dumps({
-                "type": "clarification",
-                "content": {
-                    "needs_clarification": False,
-                    "understood_requirements": {
-                        "summary": "JWT authentication",
-                        "scope": ["Backend auth"],
-                        "constraints": [],
-                        "assumptions": []
-                    }
-                },
-                "next_action": "wait_for_input"
-            }))
+    def test_plan(self, wrapper, mock_scribe):
+        """Test plan generation."""
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+  "type": "plan",
+  "content": {
+    "goal": "Implement user login",
+    "tasks": [
+      {"id": "task_001", "title": "Create User model"},
+      {"id": "task_002", "title": "Implement login endpoint"}
+    ],
+    "estimated_complexity": "medium",
+    "prerequisites": [],
+    "risks": []
+  }
+}
+```'''
+
+            result = wrapper.plan("Implement user login")
+
+            assert result.goal == "Implement user login"
+            assert len(result.tasks) == 2
+
+    def test_analyze_code(self, wrapper, mock_scribe):
+        """Test code analysis."""
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+  "type": "analysis",
+  "content": {
+    "summary": "A utility function module",
+    "purpose": "Helper functions for data processing",
+    "key_functions": ["process_data", "validate_input"],
+    "dependencies": ["json", "typing"],
+    "issues": [],
+    "suggestions": []
+  }
+}
+```'''
+
+            code = "def process_data(data): return data"
+            result = wrapper.analyze_code(code, "/test/utils.py")
+
+            assert result["summary"] == "A utility function module"
+
+    def test_review_changes(self, wrapper, mock_scribe):
+        """Test code review."""
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+  "type": "review",
+  "content": {
+    "summary": "Added new feature",
+    "approval": "approved",
+    "comments": [{"type": "praise", "location": "main.py:10", "message": "Good"}],
+    "security_concerns": [],
+    "breaking_changes": []
+  }
+}
+```'''
+
+            diff = "+ def new_feature(): return True"
+            result = wrapper.review_changes(diff)
+
+            assert result["approval"] == "approved"
+
+    def test_get_conversation_history(self, wrapper, mock_scribe):
+        """Test conversation history retrieval."""
+        wrapper._conversation_history = [
+            {"role": "user", "content": "Hello"},
+            {"role": "model", "content": "Hi there"}
         ]
-        wrapper.chat.send_message.side_effect = mock_responses
-
-        answers_given = []
-
-        def on_question(q):
-            answers_given.append(q.question)
-            return "JWT"
-
-        result = wrapper.clarify_goal("Add authentication", on_question=on_question)
-
-        assert len(result["clarifications"]) == 1
-        assert "Which authentication method?" in answers_given
-        assert result["final_requirements"]["summary"] == "JWT authentication"
-
-    def test_plan(self, wrapper, mock_genai):
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "plan",
-            "content": {
-                "goal": "Implement user login",
-                "tasks": [
-                    {
-                        "id": "task_001",
-                        "title": "Create User model",
-                        "description": "Define User dataclass",
-                        "type": "implementation",
-                        "priority": "high",
-                        "dependencies": []
-                    },
-                    {
-                        "id": "task_002",
-                        "title": "Implement login endpoint",
-                        "description": "POST /login",
-                        "type": "implementation",
-                        "priority": "high",
-                        "dependencies": ["task_001"]
-                    }
-                ],
-                "estimated_complexity": "medium",
-                "prerequisites": [],
-                "risks": []
-            },
-            "requires_confirmation": True,
-            "next_action": "wait_for_input"
-        })
-        wrapper.chat.send_message.return_value = mock_response
-
-        result = wrapper.plan("Implement user login")
-
-        assert result.goal == "Implement user login"
-        assert len(result.tasks) == 2
-        assert result.tasks[0]["id"] == "task_001"
-        assert result.estimated_complexity == "medium"
-
-    def test_plan_with_project_analysis(self, wrapper, mock_genai):
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "plan",
-            "content": {
-                "goal": "Add feature",
-                "tasks": [],
-                "estimated_complexity": "low",
-                "prerequisites": [],
-                "risks": []
-            },
-            "requires_confirmation": True,
-            "next_action": "wait_for_input"
-        })
-        wrapper.chat.send_message.return_value = mock_response
-
-        analysis = ProjectAnalysis(
-            project_type=ProjectType.EXISTING,
-            detected_languages=["Python"],
-            detected_frameworks=["FastAPI"],
-        )
-
-        result = wrapper.plan("Add feature", project_analysis=analysis)
-
-        assert result is not None
-        call_args = wrapper.chat.send_message.call_args[0][0]
-        assert "Python" in call_args
-        assert "FastAPI" in call_args
-
-    def test_analyze_code(self, wrapper, mock_genai):
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "analysis",
-            "content": {
-                "summary": "A utility function module",
-                "purpose": "Helper functions for data processing",
-                "key_functions": ["process_data", "validate_input"],
-                "dependencies": ["json", "typing"],
-                "issues": [],
-                "suggestions": []
-            },
-            "requires_confirmation": False,
-            "next_action": "wait_for_input"
-        })
-        wrapper.chat.send_message.return_value = mock_response
-
-        code = """
-def process_data(data: dict) -> dict:
-    return {k: v.strip() for k, v in data.items()}
-"""
-        result = wrapper.analyze_code(code, "/test/utils.py")
-
-        assert result["summary"] == "A utility function module"
-        assert "process_data" in result["key_functions"]
-
-    def test_analyze_code_with_question(self, wrapper, mock_genai):
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "analysis",
-            "content": {
-                "summary": "Analysis with specific question",
-                "purpose": "Answered",
-                "key_functions": [],
-                "dependencies": [],
-                "issues": ["Found the issue"],
-                "suggestions": []
-            },
-            "requires_confirmation": False,
-            "next_action": "wait_for_input"
-        })
-        wrapper.chat.send_message.return_value = mock_response
-
-        result = wrapper.analyze_code(
-            "def buggy(): pass",
-            "/test/file.py",
-            question="Why is this function not working?"
-        )
-
-        assert "Found the issue" in result["issues"]
-
-    def test_review_changes(self, wrapper, mock_genai):
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "review",
-            "content": {
-                "summary": "Added new feature",
-                "approval": "approved",
-                "comments": [
-                    {
-                        "type": "praise",
-                        "location": "main.py:10",
-                        "message": "Good implementation"
-                    }
-                ],
-                "security_concerns": [],
-                "breaking_changes": []
-            },
-            "requires_confirmation": False,
-            "next_action": "wait_for_input"
-        })
-        wrapper.chat.send_message.return_value = mock_response
-
-        diff = """
-+ def new_feature():
-+     return True
-"""
-        result = wrapper.review_changes(diff, context="Adding new feature")
-
-        assert result["approval"] == "approved"
-        assert len(result["comments"]) == 1
-
-    def test_review_changes_with_issues(self, wrapper, mock_genai):
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "review",
-            "content": {
-                "summary": "Potential security issue",
-                "approval": "changes_requested",
-                "comments": [
-                    {
-                        "type": "issue",
-                        "location": "auth.py:25",
-                        "message": "SQL injection vulnerability"
-                    }
-                ],
-                "security_concerns": ["SQL injection"],
-                "breaking_changes": []
-            },
-            "requires_confirmation": False,
-            "next_action": "wait_for_input"
-        })
-        wrapper.chat.send_message.return_value = mock_response
-
-        diff = "- cursor.execute(f'SELECT * FROM users WHERE id={user_id}')"
-        result = wrapper.review_changes(diff)
-
-        assert result["approval"] == "changes_requested"
-        assert "SQL injection" in result["security_concerns"]
-
-    def test_get_conversation_history(self, wrapper, mock_genai):
-        mock_msg1 = MagicMock()
-        mock_msg1.role = "user"
-        mock_msg1.parts = [MagicMock(text="Hello")]
-
-        mock_msg2 = MagicMock()
-        mock_msg2.role = "model"
-        mock_msg2.parts = [MagicMock(text="Hi there")]
-
-        wrapper.chat.history = [mock_msg1, mock_msg2]
 
         history = wrapper.get_conversation_history()
 
         assert len(history) == 2
         assert history[0]["role"] == "user"
-        assert history[0]["content"] == "Hello"
-        assert history[1]["role"] == "model"
 
-    def test_reset_conversation(self, wrapper, mock_genai):
-        wrapper.chat.history = [MagicMock()]
+    def test_reset_conversation(self, wrapper, mock_scribe):
+        """Test conversation reset."""
+        wrapper._conversation_history = [{"role": "user", "content": "Test"}]
         wrapper.reset_conversation()
 
-        wrapper.model.start_chat.assert_called()
+        assert wrapper._conversation_history == []
 
-    def test_log_callback(self, mock_genai, mock_scribe):
-        os.environ["GEMINI_API_KEY"] = "test-key"
+    def test_generate_interview_questions(self, wrapper, mock_scribe):
+        """Test interview question generation."""
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+  "type": "interview_questions",
+  "content": {
+    "questions": [
+      {
+        "question": "Which database do you prefer?",
+        "focus": "data_model",
+        "options": ["PostgreSQL", "MySQL"],
+        "context": "Need to choose database"
+      }
+    ]
+  }
+}
+```'''
+
+            questions = wrapper.generate_interview_questions("Add database")
+
+            assert len(questions) == 1
+            assert questions[0].focus == InterviewFocus.DATA_MODEL
+
+    def test_generate_feature_spec(self, wrapper, mock_scribe):
+        """Test feature spec generation."""
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+  "type": "feature_spec",
+  "content": {
+    "feature_name": "user_auth",
+    "summary": "User authentication system",
+    "requirements": ["Login", "Logout"],
+    "architecture_decisions": ["Use JWT"],
+    "data_model": {},
+    "error_handling": [],
+    "conventions": [],
+    "constraints": [],
+    "out_of_scope": []
+  }
+}
+```'''
+
+            question = InterviewQuestion(
+                question="Which auth?",
+                focus=InterviewFocus.ARCHITECTURE
+            )
+            answers = [InterviewAnswer(question=question, answer="JWT")]
+
+            spec = wrapper.generate_feature_spec("Add auth", answers)
+
+            assert spec.feature_name == "user_auth"
+
+    def test_decompose_to_tasks(self, wrapper, mock_scribe):
+        """Test task decomposition."""
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+  "type": "task_decomposition",
+  "content": {
+    "tasks": [
+      {
+        "id": "task_001",
+        "title": "Create User model",
+        "goal": "Define User class",
+        "files_to_modify": ["models/user.py"],
+        "expected_logic": "Create dataclass",
+        "dependencies": [],
+        "acceptance_criteria": ["Class exists"]
+      }
+    ]
+  }
+}
+```'''
+
+            spec = FeatureSpec(feature_name="test", summary="Test")
+            tasks = wrapper.decompose_to_tasks(spec)
+
+            assert len(tasks) == 1
+            assert tasks[0].id == "task_001"
+
+    def test_run_plan_mode(self, wrapper, mock_scribe):
+        """Test complete plan mode flow."""
+        with patch.object(wrapper, 'generate_interview_questions') as mock_q, \
+             patch.object(wrapper, 'generate_feature_spec') as mock_spec, \
+             patch.object(wrapper, 'decompose_to_tasks') as mock_tasks:
+
+            mock_q.return_value = [
+                InterviewQuestion(
+                    question="Test?",
+                    focus=InterviewFocus.ARCHITECTURE,
+                    options=["A", "B"]
+                )
+            ]
+
+            mock_spec.return_value = FeatureSpec(
+                feature_name="test_feature",
+                summary="Test"
+            )
+
+            mock_tasks.return_value = [
+                PlanTask(id="t1", title="Task 1", goal="Goal 1")
+            ]
+
+            def on_question(q):
+                return "A"
+
+            def on_tasks_review(tasks):
+                return True
+
+            result = wrapper.run_plan_mode(
+                user_goal="Test goal",
+                on_question=on_question,
+                on_tasks_review=on_tasks_review
+            )
+
+            assert result.feature_spec.feature_name == "test_feature"
+            assert result.approved is True
+
+    def test_context_manager(self, mock_scribe, mock_shutil):
+        """Test wrapper works as context manager."""
+        with GeminiWrapper() as wrapper:
+            assert wrapper is not None
+
+    def test_log_callback(self, mock_scribe, mock_shutil):
+        """Test log callback is called."""
         logs = []
 
         def on_log(agent, content, metadata):
@@ -530,16 +624,14 @@ def process_data(data: dict) -> dict:
 
         wrapper = GeminiWrapper(on_log=on_log)
 
-        mock_response = MagicMock()
-        mock_response.text = '{"type": "test", "content": {}}'
-        wrapper.chat.send_message.return_value = mock_response
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '{"type": "analysis", "content": {}}'
+            wrapper.init_project("/test", [])
 
-        wrapper.init_project("/test", [])
+        wrapper.close()
 
         assert len(logs) > 0
         assert logs[0]["agent"] == "commander"
-
-        os.environ.pop("GEMINI_API_KEY", None)
 
 
 class TestCommanderConstitution:

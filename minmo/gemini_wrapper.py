@@ -1,17 +1,26 @@
 """
 Gemini Wrapper - Minmo-Engine의 지휘관 (Commander)
-Gemini API를 사용하여 프로젝트 분석, 계획 수립, 요구사항 명확화를 담당
+Gemini CLI (@google/gemini-cli)를 pexpect로 제어하여 프로젝트 분석, 계획 수립을 담당
 """
 
 import os
+import sys
 import json
+import re
+import time
+import shutil
 from typing import Any, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
-import google.generativeai as genai
-
 from minmo.scribe_mcp import log_event, get_state, init_database
+
+# 플랫폼별 pexpect 임포트
+if sys.platform == "win32":
+    from pexpect.popen_spawn import PopenSpawn as PexpectSpawn
+else:
+    import pexpect
+    PexpectSpawn = pexpect.spawn
 
 
 # ============================================================
@@ -168,7 +177,7 @@ class PlanTask:
 @dataclass
 class PlanModeResult:
     """Plan Mode 결과"""
-    feature_spec: FeatureSpec
+    feature_spec: FeatureSpec | None = None
     tasks: list[PlanTask] = field(default_factory=list)
     interview_history: list[InterviewAnswer] = field(default_factory=list)
     approved: bool = False
@@ -176,70 +185,99 @@ class PlanModeResult:
 
 
 # ============================================================
-# Gemini Wrapper 클래스
+# Gemini Wrapper 클래스 (CLI 기반)
 # ============================================================
 class GeminiWrapper:
     """
-    Gemini API 래퍼 - 지휘관 역할
+    Gemini CLI 래퍼 - 지휘관 역할
 
-    프로젝트 분석, 요구사항 명확화, 작업 계획 수립을 담당합니다.
+    @google/gemini-cli를 pexpect로 제어하여 프로젝트 분석,
+    요구사항 명확화, 작업 계획 수립을 담당합니다.
+
+    gemini login 세션을 사용하므로 API 키가 필요 없습니다.
     """
+
+    # Gemini CLI 프롬프트 패턴
+    PROMPT_PATTERNS = [
+        r"[>❯►]\s*$",
+        r"gemini>\s*$",
+        r"\?\s*$",
+    ]
+    READY_PATTERN = r"[>❯►]\s*$"
 
     def __init__(
         self,
-        api_key: str | None = None,
-        model_name: str = "gemini-1.5-flash",
-        temperature: float = 0.3,
-        on_log: Callable[[str, str, dict | None], None] | None = None
+        working_directory: str | None = None,
+        timeout_seconds: int = 120,
+        on_log: Callable[[str, str, dict | None], None] | None = None,
+        verbose: bool = False
     ):
         """
-        GeminiWrapper 초기화
+        GeminiWrapper 초기화 (Gemini CLI 기반)
 
         Args:
-            api_key: Gemini API 키 (없으면 환경변수 GEMINI_API_KEY 사용)
-            model_name: 사용할 모델 (gemini-1.5-pro, gemini-1.5-flash)
-            temperature: 생성 온도 (0.0 ~ 1.0, 낮을수록 결정적)
+            working_directory: 작업 디렉토리 (기본: 현재 디렉토리)
+            timeout_seconds: 명령 타임아웃 (초)
             on_log: 로그 콜백 함수 (agent, content, metadata)
+            verbose: 상세 출력 여부
         """
-        self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
-        if not self.api_key:
-            raise ValueError(
-                "Gemini API 키가 필요합니다. "
-                "환경변수 GEMINI_API_KEY를 설정하거나 api_key 파라미터를 전달하세요."
-            )
-
-        self.model_name = model_name
-        self.temperature = temperature
+        self.working_directory = working_directory or os.getcwd()
+        self.timeout_seconds = timeout_seconds
         self.on_log = on_log
+        self.verbose = verbose
 
-        # Gemini 설정
-        genai.configure(api_key=self.api_key)
+        # Gemini CLI 경로 확인
+        self.gemini_path = self._find_gemini_cli()
 
-        # 모델 초기화
-        self.model = genai.GenerativeModel(
-            model_name=self.model_name,
-            generation_config=genai.GenerationConfig(
-                temperature=self.temperature,
-                top_p=0.95,
-                top_k=40,
-                max_output_tokens=8192,
-            ),
-            system_instruction=COMMANDER_CONSTITUTION
-        )
+        # 프로세스 핸들
+        self._process: PexpectSpawn | None = None
+        self._is_started = False
 
         # 대화 기록
-        self.chat = self.model.start_chat(history=[])
+        self._conversation_history: list[dict[str, str]] = []
 
         # Scribe 연동을 위한 DB 초기화
         try:
             init_database()
         except Exception:
-            pass  # DB 초기화 실패해도 계속 진행
+            pass
+
+    def _find_gemini_cli(self) -> str:
+        """Gemini CLI 실행 파일을 찾습니다."""
+        # 환경변수에서 먼저 확인
+        gemini_path = os.environ.get("GEMINI_CLI_PATH")
+        if gemini_path and os.path.exists(gemini_path):
+            return gemini_path
+
+        # PATH에서 검색
+        gemini_cmd = "gemini.cmd" if sys.platform == "win32" else "gemini"
+        found = shutil.which(gemini_cmd)
+        if found:
+            return found
+
+        # npm global 경로 확인
+        if sys.platform == "win32":
+            npm_paths = [
+                os.path.expandvars(r"%APPDATA%\npm\gemini.cmd"),
+                os.path.expandvars(r"%LOCALAPPDATA%\npm\gemini.cmd"),
+            ]
+        else:
+            npm_paths = [
+                "/usr/local/bin/gemini",
+                os.path.expanduser("~/.npm-global/bin/gemini"),
+                os.path.expanduser("~/node_modules/.bin/gemini"),
+            ]
+
+        for path in npm_paths:
+            if os.path.exists(path):
+                return path
+
+        return gemini_cmd
 
     def _log(self, content: str, metadata: dict | None = None) -> None:
         """Scribe를 통해 로그를 기록합니다."""
         try:
-            result = log_event(
+            log_event(
                 agent="commander",
                 content=content,
                 metadata=json.dumps(metadata, ensure_ascii=False) if metadata else None
@@ -247,43 +285,174 @@ class GeminiWrapper:
             if self.on_log:
                 self.on_log("commander", content, metadata)
         except Exception as e:
-            # 로깅 실패해도 계속 진행
             if self.on_log:
                 self.on_log("commander", f"[로그 실패] {content}", {"error": str(e)})
 
-    def _send_message(self, message: str) -> str:
-        """Gemini에 메시지를 보내고 응답을 받습니다."""
+    def _start_session(self) -> bool:
+        """Gemini CLI 대화형 세션을 시작합니다."""
+        if self._is_started and self._process:
+            return True
+
+        self._log("Gemini CLI 세션 시작", {"path": self.gemini_path})
+
         try:
-            response = self.chat.send_message(message)
-            return response.text
+            # 환경변수 설정 (UTF-8 인코딩)
+            env = os.environ.copy()
+            env["LANG"] = "C.UTF-8"
+            env["LC_ALL"] = "C.UTF-8"
+            env["PYTHONIOENCODING"] = "utf-8"
+
+            if sys.platform == "win32":
+                self._process = PexpectSpawn(
+                    f'"{self.gemini_path}"',
+                    encoding="utf-8",
+                    timeout=self.timeout_seconds,
+                    cwd=self.working_directory,
+                    env=env
+                )
+            else:
+                self._process = pexpect.spawn(
+                    self.gemini_path,
+                    encoding="utf-8",
+                    timeout=self.timeout_seconds,
+                    cwd=self.working_directory,
+                    env=env
+                )
+
+            # 초기 프롬프트 대기
+            time.sleep(2)
+            self._is_started = True
+            self._log("Gemini CLI 세션 시작됨")
+            return True
+
         except Exception as e:
-            self._log(f"Gemini API 오류: {str(e)}", {"error_type": type(e).__name__})
-            raise
+            self._log(f"Gemini CLI 시작 실패: {str(e)}", {"error": str(e)})
+            return False
+
+    def _send_message(self, message: str) -> str:
+        """Gemini CLI에 메시지를 보내고 응답을 받습니다."""
+        if not self._process:
+            if not self._start_session():
+                return ""
+
+        self._conversation_history.append({"role": "user", "content": message})
+        output_buffer = []
+
+        try:
+            # 명령 전송 (UTF-8 인코딩)
+            self._process.sendline(message.encode("utf-8").decode("utf-8"))
+            time.sleep(0.5)
+
+            # 응답 수집
+            start_time = time.time()
+            while True:
+                elapsed = time.time() - start_time
+                if elapsed > self.timeout_seconds:
+                    break
+
+                try:
+                    if sys.platform == "win32":
+                        line = self._process.readline()
+                        if line:
+                            line = line.strip()
+                            if line and line != message:
+                                output_buffer.append(line)
+                                if self.verbose:
+                                    print(f"[Gemini] {line}")
+
+                        if not self._process.isalive():
+                            break
+
+                        # 프롬프트 패턴 확인
+                        if output_buffer:
+                            last_line = output_buffer[-1]
+                            if re.search(self.READY_PATTERN, last_line):
+                                output_buffer.pop()
+                                break
+                    else:
+                        index = self._process.expect(
+                            self.PROMPT_PATTERNS + [pexpect.TIMEOUT, pexpect.EOF],
+                            timeout=2
+                        )
+                        if self._process.before:
+                            text = self._process.before.strip()
+                            if text and text != message:
+                                output_buffer.append(text)
+                        if index < len(self.PROMPT_PATTERNS):
+                            break
+                        elif index == len(self.PROMPT_PATTERNS):
+                            continue
+                        else:
+                            break
+
+                except Exception as e:
+                    if "EOF" in str(e) or "timeout" in str(e).lower():
+                        continue
+                    break
+
+            response = "\n".join(output_buffer)
+            self._conversation_history.append({"role": "model", "content": response})
+            return response
+
+        except Exception as e:
+            self._log(f"명령 실행 오류: {str(e)}")
+            return ""
 
     def _parse_json_response(self, response: str) -> dict[str, Any]:
         """JSON 응답을 파싱합니다."""
         # JSON 블록 추출 시도
-        if "```json" in response:
-            start = response.find("```json") + 7
-            end = response.find("```", start)
-            if end > start:
-                response = response[start:end].strip()
-        elif "```" in response:
+        json_match = re.search(r"```json\s*([\s\S]*?)\s*```", response)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # 일반 코드 블록
+        if "```" in response:
             start = response.find("```") + 3
             end = response.find("```", start)
             if end > start:
-                response = response[start:end].strip()
+                try:
+                    return json.loads(response[start:end].strip())
+                except json.JSONDecodeError:
+                    pass
 
+        # 순수 JSON 시도
+        json_patterns = [r"\{[\s\S]*\}", r"\[[\s\S]*\]"]
+        for pattern in json_patterns:
+            match = re.search(pattern, response)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except json.JSONDecodeError:
+                    continue
+
+        return {
+            "type": "text",
+            "content": response,
+            "requires_confirmation": False,
+            "next_action": "wait_for_input"
+        }
+
+    def check_login_status(self) -> bool:
+        """Gemini CLI 로그인 상태를 확인합니다."""
         try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            # JSON 파싱 실패 시 텍스트 응답 반환
-            return {
-                "type": "text",
-                "content": response,
-                "requires_confirmation": False,
-                "next_action": "wait_for_input"
-            }
+            import subprocess
+            env = os.environ.copy()
+            env["LANG"] = "C.UTF-8"
+
+            result = subprocess.run(
+                [self.gemini_path, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=env,
+                encoding="utf-8"
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
 
     # ============================================================
     # 핵심 메서드
@@ -292,9 +461,6 @@ class GeminiWrapper:
     def init_project(self, project_path: str, file_list: list[str] | None = None) -> ProjectAnalysis:
         """
         프로젝트를 초기화하고 분석합니다.
-
-        - 기존 프로젝트: 코드 분석 후 구조 파악, 컨펌 요청
-        - 신규 프로젝트: 언어/툴/DB 비교 테이블 제안
 
         Args:
             project_path: 프로젝트 경로
@@ -305,12 +471,11 @@ class GeminiWrapper:
         """
         self._log("프로젝트 초기화 시작", {"path": project_path})
 
-        # 기존 프로젝트 여부 판단
         is_existing = file_list and len(file_list) > 0
 
         if is_existing:
-            # 기존 프로젝트 분석
-            prompt = f"""
+            prompt = f"""{COMMANDER_CONSTITUTION}
+
 다음 프로젝트를 분석해주세요.
 
 프로젝트 경로: {project_path}
@@ -328,54 +493,37 @@ class GeminiWrapper:
     "detected_frameworks": ["프레임워크1"],
     "detected_databases": ["DB1"],
     "structure_summary": "프로젝트 구조 요약",
-    "key_files": ["중요 파일 경로"],
     "recommendations": ["권장사항"],
     "confidence": 0.0 ~ 1.0
-  }},
-  "requires_confirmation": true,
-  "next_action": "wait_for_input"
+  }}
 }}
 ```
 """
         else:
-            # 신규 프로젝트 제안
-            prompt = f"""
+            prompt = f"""{COMMANDER_CONSTITUTION}
+
 새 프로젝트를 시작합니다.
 
 프로젝트 경로: {project_path}
 
-다음 JSON 형식으로 기술 스택 비교 테이블을 제안해주세요:
+다음 JSON 형식으로 기술 스택 제안을 해주세요:
 ```json
 {{
   "type": "recommendation",
   "content": {{
     "project_type": "new",
-    "language_comparison": [
-      {{"name": "Python", "pros": ["장점"], "cons": ["단점"], "use_case": "적합한 경우"}},
-      {{"name": "TypeScript", "pros": ["장점"], "cons": ["단점"], "use_case": "적합한 경우"}}
-    ],
-    "framework_comparison": [
-      {{"name": "FastAPI", "pros": ["장점"], "cons": ["단점"], "use_case": "적합한 경우"}}
-    ],
-    "database_comparison": [
-      {{"name": "PostgreSQL", "pros": ["장점"], "cons": ["단점"], "use_case": "적합한 경우"}}
-    ],
-    "recommended_stack": {{
-      "language": "추천 언어",
-      "framework": "추천 프레임워크",
-      "database": "추천 DB",
-      "reasoning": "추천 이유"
-    }}
-  }},
-  "requires_confirmation": true,
-  "next_action": "wait_for_input"
+    "detected_languages": [],
+    "detected_frameworks": [],
+    "detected_databases": [],
+    "recommendations": ["추천사항"],
+    "confidence": 0.5
+  }}
 }}
 ```
 """
 
         response = self._send_message(prompt)
         parsed = self._parse_json_response(response)
-
         content = parsed.get("content", {})
 
         analysis = ProjectAnalysis(
@@ -408,8 +556,8 @@ class GeminiWrapper:
 
         Args:
             user_goal: 사용자의 목표/요구사항
-            context: 추가 컨텍스트 (프로젝트 정보 등)
-            on_question: 질문 콜백 함수 (질문을 받고 답변을 반환)
+            context: 추가 컨텍스트
+            on_question: 질문 콜백 함수
             max_rounds: 최대 질문 라운드 수
 
         Returns:
@@ -417,13 +565,14 @@ class GeminiWrapper:
         """
         self._log("요구사항 명확화 시작", {"goal": user_goal})
 
-        clarified_requirements = {
+        clarified = {
             "original_goal": user_goal,
             "clarifications": [],
             "final_requirements": None
         }
 
-        prompt = f"""
+        prompt = f"""{COMMANDER_CONSTITUTION}
+
 사용자의 요구사항을 분석하고, 불명확한 부분이 있으면 질문해주세요.
 
 **사용자 요구사항:** {user_goal}
@@ -433,7 +582,7 @@ class GeminiWrapper:
 
 다음 JSON 형식으로 응답해주세요:
 
-1. 질문이 필요한 경우:
+질문이 필요한 경우:
 ```json
 {{
   "type": "clarification",
@@ -447,13 +596,11 @@ class GeminiWrapper:
         "required": true
       }}
     ]
-  }},
-  "requires_confirmation": false,
-  "next_action": "clarify"
+  }}
 }}
 ```
 
-2. 요구사항이 명확한 경우:
+요구사항이 명확한 경우:
 ```json
 {{
   "type": "clarification",
@@ -463,11 +610,9 @@ class GeminiWrapper:
       "summary": "요구사항 요약",
       "scope": ["범위1", "범위2"],
       "constraints": ["제약사항"],
-      "assumptions": ["가정사항 (확인 필요)"]
+      "assumptions": ["가정사항"]
     }}
-  }},
-  "requires_confirmation": true,
-  "next_action": "wait_for_input"
+  }}
 }}
 ```
 """
@@ -475,16 +620,12 @@ class GeminiWrapper:
         for round_num in range(max_rounds):
             response = self._send_message(prompt)
             parsed = self._parse_json_response(response)
-
             content = parsed.get("content", {})
-            needs_clarification = content.get("needs_clarification", False)
 
-            if not needs_clarification:
-                # 명확화 완료
-                clarified_requirements["final_requirements"] = content.get("understood_requirements", {})
+            if not content.get("needs_clarification", False):
+                clarified["final_requirements"] = content.get("understood_requirements", {})
                 break
 
-            # 질문 처리
             questions = content.get("questions", [])
             answers = []
 
@@ -499,26 +640,20 @@ class GeminiWrapper:
                 if on_question:
                     answer = on_question(question)
                 else:
-                    # 콜백이 없으면 첫 번째 옵션 선택 (테스트용)
                     answer = question.options[0] if question.options else "확인"
 
-                answers.append({
-                    "question": question.question,
-                    "answer": answer
-                })
+                answers.append({"question": question.question, "answer": answer})
 
-            clarified_requirements["clarifications"].append({
+            clarified["clarifications"].append({
                 "round": round_num + 1,
                 "questions": questions,
                 "answers": answers
             })
 
-            # 다음 라운드를 위한 프롬프트 업데이트
             prompt = f"""
 사용자의 답변을 바탕으로 추가 질문이 필요한지 판단해주세요.
 
 **원래 요구사항:** {user_goal}
-
 **이전 질문과 답변:**
 {json.dumps(answers, indent=2, ensure_ascii=False)}
 
@@ -526,11 +661,11 @@ class GeminiWrapper:
 """
 
         self._log("요구사항 명확화 완료", {
-            "rounds": len(clarified_requirements["clarifications"]),
-            "final": clarified_requirements["final_requirements"]
+            "rounds": len(clarified["clarifications"]),
+            "final": clarified["final_requirements"]
         })
 
-        return clarified_requirements
+        return clarified
 
     def plan(
         self,
@@ -561,7 +696,8 @@ class GeminiWrapper:
 - 구조: {project_analysis.structure_summary or '분석 전'}
 """
 
-        prompt = f"""
+        prompt = f"""{COMMANDER_CONSTITUTION}
+
 다음 목표에 대한 작업 계획을 수립해주세요.
 
 **목표:** {goal}
@@ -585,29 +721,19 @@ class GeminiWrapper:
         "type": "analysis|implementation|test|documentation",
         "priority": "high|medium|low",
         "dependencies": ["선행 작업 ID"],
-        "estimated_lines": 50,
         "files_affected": ["예상 수정 파일"]
       }}
     ],
     "estimated_complexity": "low|medium|high|very_high",
     "prerequisites": ["전제 조건"],
-    "risks": ["잠재적 위험"],
-    "success_criteria": ["완료 기준"]
-  }},
-  "requires_confirmation": true,
-  "next_action": "wait_for_input"
+    "risks": ["잠재적 위험"]
+  }}
 }}
 ```
-
-**주의사항:**
-- 각 작업은 독립적으로 실행 가능해야 합니다.
-- 작업 크기는 코드 50-200줄 수준으로 분해하세요.
-- 불필요한 작업을 추가하지 마세요.
 """
 
         response = self._send_message(prompt)
         parsed = self._parse_json_response(response)
-
         content = parsed.get("content", {})
 
         plan = TaskPlan(
@@ -632,7 +758,7 @@ class GeminiWrapper:
         Args:
             code: 분석할 코드
             file_path: 파일 경로
-            question: 특정 질문 (없으면 일반 분석)
+            question: 특정 질문
 
         Returns:
             분석 결과
@@ -661,10 +787,8 @@ class GeminiWrapper:
     "key_functions": ["주요 함수/클래스"],
     "dependencies": ["의존성"],
     "issues": ["잠재적 문제점"],
-    "suggestions": ["개선 제안 (요청 시에만)"]
-  }},
-  "requires_confirmation": false,
-  "next_action": "wait_for_input"
+    "suggestions": ["개선 제안"]
+  }}
 }}
 ```
 """
@@ -716,17 +840,9 @@ class GeminiWrapper:
     ],
     "security_concerns": ["보안 우려사항"],
     "breaking_changes": ["호환성 문제"]
-  }},
-  "requires_confirmation": false,
-  "next_action": "wait_for_input"
+  }}
 }}
 ```
-
-**리뷰 기준:**
-- 요청된 기능만 구현되었는지
-- 불필요한 변경이 없는지
-- 보안 취약점이 없는지
-- 기존 코드와 일관성이 있는지
 """
 
         response = self._send_message(prompt)
@@ -738,17 +854,16 @@ class GeminiWrapper:
 
     def get_conversation_history(self) -> list[dict[str, str]]:
         """대화 기록을 반환합니다."""
-        history = []
-        for msg in self.chat.history:
-            history.append({
-                "role": msg.role,
-                "content": msg.parts[0].text if msg.parts else ""
-            })
-        return history
+        return self._conversation_history.copy()
 
     def reset_conversation(self) -> None:
         """대화를 초기화합니다."""
-        self.chat = self.model.start_chat(history=[])
+        self._conversation_history = []
+        if self._process:
+            try:
+                self._process.sendline("/reset")
+            except Exception:
+                pass
         self._log("대화 초기화")
 
     # ============================================================
@@ -766,7 +881,7 @@ class GeminiWrapper:
 
         Args:
             user_goal: 사용자의 요구사항/목표
-            project_context: 프로젝트 컨텍스트 (언어, 프레임워크 등)
+            project_context: 프로젝트 컨텍스트
             existing_conventions: 기존 프로젝트 컨벤션 목록
 
         Returns:
@@ -781,7 +896,8 @@ class GeminiWrapper:
 {chr(10).join(f"- {c}" for c in existing_conventions)}
 """
 
-        prompt = f"""
+        prompt = f"""{COMMANDER_CONSTITUTION}
+
 사용자의 요구사항을 분석하고, 구현 전 반드시 명확화해야 할 심층 질문을 생성해주세요.
 
 **사용자 요구사항:** {user_goal}
@@ -794,14 +910,13 @@ class GeminiWrapper:
 **질문 생성 규칙:**
 1. 최소 3개, 최대 7개의 질문을 생성합니다.
 2. 각 질문은 다음 영역 중 하나에 초점을 맞춥니다:
-   - architecture: 전체 구조, 컴포넌트 관계, 레이어 분리
-   - data_model: 데이터 구조, 스키마, 타입 정의
-   - exception_handling: 에러 처리, 실패 시나리오, 복구 전략
-   - convention: 기존 컨벤션 준수, 네이밍, 코드 스타일
-   - integration: 외부 시스템 연동, API 설계
-   - testing: 테스트 전략, 커버리지 목표
-3. 추측하지 말고 불확실한 부분을 질문합니다.
-4. 각 질문에는 선택 가능한 옵션을 제공합니다 (2-4개).
+   - architecture: 전체 구조, 컴포넌트 관계
+   - data_model: 데이터 구조, 스키마
+   - exception_handling: 에러 처리, 복구 전략
+   - convention: 기존 컨벤션 준수, 네이밍
+   - integration: 외부 시스템 연동
+   - testing: 테스트 전략
+3. 각 질문에는 선택 가능한 옵션을 제공합니다 (2-4개).
 
 다음 JSON 형식으로 응답해주세요:
 ```json
@@ -812,9 +927,9 @@ class GeminiWrapper:
       {{
         "question": "구체적인 질문 내용",
         "focus": "architecture|data_model|exception_handling|convention|integration|testing",
-        "options": ["옵션1", "옵션2", "옵션3", "직접 입력"],
-        "context": "이 질문을 하는 이유와 배경",
-        "follow_up_hint": "답변에 따라 추가로 확인할 수 있는 사항"
+        "options": ["옵션1", "옵션2", "직접 입력"],
+        "context": "이 질문을 하는 이유",
+        "follow_up_hint": "추가 확인 사항"
       }}
     ]
   }}
@@ -865,14 +980,14 @@ class GeminiWrapper:
         """
         self._log("기획서 생성 시작", {"goal": user_goal})
 
-        # 인터뷰 내용 정리
-        qa_list = []
-        for ia in interview_answers:
-            qa_list.append({
+        qa_list = [
+            {
                 "question": ia.question.question,
                 "focus": ia.question.focus.value,
                 "answer": ia.answer
-            })
+            }
+            for ia in interview_answers
+        ]
 
         prompt = f"""
 인터뷰 결과를 바탕으로 기능 기획서를 작성해주세요.
@@ -892,43 +1007,16 @@ class GeminiWrapper:
   "content": {{
     "feature_name": "기능명 (영문, snake_case)",
     "summary": "기능 요약 (1-2문장)",
-    "requirements": [
-      "구체적인 요구사항 1",
-      "구체적인 요구사항 2"
-    ],
-    "architecture_decisions": [
-      "아키텍처 결정 사항 1 (이유 포함)",
-      "아키텍처 결정 사항 2"
-    ],
-    "data_model": {{
-      "entities": ["엔티티1", "엔티티2"],
-      "relationships": ["관계 설명"],
-      "schema_notes": "스키마 관련 노트"
-    }},
-    "error_handling": [
-      "에러 시나리오 1: 처리 방법",
-      "에러 시나리오 2: 처리 방법"
-    ],
-    "conventions": [
-      "준수할 컨벤션 1",
-      "준수할 컨벤션 2"
-    ],
-    "constraints": [
-      "제약 조건 1",
-      "제약 조건 2"
-    ],
-    "out_of_scope": [
-      "이번 구현에서 제외할 것 1",
-      "제외할 것 2"
-    ]
+    "requirements": ["구체적인 요구사항"],
+    "architecture_decisions": ["아키텍처 결정 사항"],
+    "data_model": {{"entities": [], "relationships": []}},
+    "error_handling": ["에러 시나리오: 처리 방법"],
+    "conventions": ["준수할 컨벤션"],
+    "constraints": ["제약 조건"],
+    "out_of_scope": ["범위 외 항목"]
   }}
 }}
 ```
-
-**작성 규칙:**
-- 인터뷰에서 확인된 내용만 포함합니다.
-- 추측하거나 가정한 내용은 포함하지 않습니다.
-- 명확하게 합의되지 않은 부분은 constraints에 명시합니다.
 """
 
         response = self._send_message(prompt)
@@ -964,7 +1052,7 @@ class GeminiWrapper:
             project_context: 프로젝트 컨텍스트
 
         Returns:
-            PlanTask 목록 (각 Task는 목표, 수정할 파일, 예상 로직 포함)
+            PlanTask 목록
         """
         self._log("태스크 분해 시작", {"feature": spec.feature_name})
 
@@ -997,30 +1085,16 @@ class GeminiWrapper:
       {{
         "id": "task_001",
         "title": "작업 제목",
-        "goal": "이 작업이 달성해야 할 구체적인 목표",
-        "files_to_modify": [
-          "수정할 파일 경로 1",
-          "새로 생성할 파일 경로 2"
-        ],
-        "expected_logic": "예상되는 구현 로직 설명 (상세히)",
+        "goal": "구체적인 목표",
+        "files_to_modify": ["수정할 파일"],
+        "expected_logic": "구현 로직 설명",
         "dependencies": ["선행 작업 ID"],
-        "acceptance_criteria": [
-          "완료 조건 1",
-          "완료 조건 2"
-        ]
+        "acceptance_criteria": ["완료 조건"]
       }}
     ]
   }}
 }}
 ```
-
-**분해 규칙:**
-1. 각 태스크는 독립적으로 실행 가능해야 합니다.
-2. 태스크 크기는 코드 50-150줄 수준으로 분해합니다.
-3. 파일 경로는 구체적으로 명시합니다.
-4. expected_logic은 실제 구현에 필요한 정보를 상세히 기술합니다.
-5. acceptance_criteria는 테스트 가능한 조건으로 작성합니다.
-6. 불필요한 태스크를 추가하지 않습니다.
 """
 
         response = self._send_message(prompt)
@@ -1059,18 +1133,19 @@ class GeminiWrapper:
             architecture_info: 기존 아키텍처 정보
 
         Returns:
-            검증 결과 (violations, warnings, approved)
+            검증 결과
         """
         self._log("컨벤션 검증 시작", {"task_count": len(tasks)})
 
-        tasks_summary = []
-        for t in tasks:
-            tasks_summary.append({
+        tasks_summary = [
+            {
                 "id": t.id,
                 "title": t.title,
                 "files": t.files_to_modify,
                 "logic": t.expected_logic
-            })
+            }
+            for t in tasks
+        ]
 
         prompt = f"""
 제안된 태스크들이 기존 프로젝트 컨벤션과 아키텍처를 준수하는지 검증해주세요.
@@ -1099,23 +1174,11 @@ class GeminiWrapper:
         "suggestion": "수정 제안"
       }}
     ],
-    "warnings": [
-      "경고 메시지 1",
-      "경고 메시지 2"
-    ],
-    "recommendations": [
-      "권장 사항 1",
-      "권장 사항 2"
-    ]
+    "warnings": ["경고 메시지"],
+    "recommendations": ["권장 사항"]
   }}
 }}
 ```
-
-**검증 기준:**
-- 파일 구조가 기존 패턴을 따르는지
-- 네이밍 컨벤션을 준수하는지
-- 레이어 분리가 올바른지
-- 기존 패턴과 일관성이 있는지
 """
 
         response = self._send_message(prompt)
@@ -1154,9 +1217,9 @@ class GeminiWrapper:
             project_context: 프로젝트 컨텍스트
             existing_conventions: 기존 컨벤션 목록
             architecture_info: 아키텍처 정보
-            on_question: 질문 콜백 (질문 → 답변)
-            on_spec_review: 기획서 리뷰 콜백 (기획서 → 승인여부)
-            on_tasks_review: 태스크 리뷰 콜백 (태스크 목록 → 승인여부)
+            on_question: 질문 콜백
+            on_spec_review: 기획서 리뷰 콜백
+            on_tasks_review: 태스크 리뷰 콜백
 
         Returns:
             PlanModeResult: Plan Mode 결과
@@ -1176,7 +1239,6 @@ class GeminiWrapper:
             if on_question:
                 answer = on_question(q)
             else:
-                # 콜백이 없으면 첫 번째 옵션 선택 (테스트용)
                 answer = q.options[0] if q.options else "확인"
 
             interview_answers.append(InterviewAnswer(question=q, answer=answer))
@@ -1242,3 +1304,28 @@ class GeminiWrapper:
         })
 
         return result
+
+    def close(self) -> None:
+        """Gemini CLI 세션을 종료합니다."""
+        if self._process:
+            try:
+                self._process.sendline("/exit")
+                time.sleep(0.5)
+                if sys.platform == "win32":
+                    self._process.kill(9)
+                else:
+                    self._process.close()
+            except Exception:
+                pass
+            finally:
+                self._process = None
+                self._is_started = False
+
+        self._log("Gemini CLI 세션 종료")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False

@@ -4,7 +4,7 @@ Minmo-Engine: MCP 통합 자동화 프레임워크
 Claude Code와 Gemini를 연동한 멀티 에이전트 오케스트레이션 시스템
 """
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 __author__ = "Minmo Team"
 
 from minmo.orchestrator import MinmoOrchestrator, ScribeMCP

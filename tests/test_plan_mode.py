@@ -126,22 +126,7 @@ class TestPlanModeDataClasses:
 
 
 class TestGeminiWrapperPlanMode:
-    """Tests for GeminiWrapper Plan Mode methods."""
-
-    @pytest.fixture
-    def mock_gemini_model(self):
-        """Mock Gemini model."""
-        with patch("minmo.gemini_wrapper.genai") as mock_genai:
-            mock_model = MagicMock()
-            mock_chat = MagicMock()
-            mock_model.start_chat.return_value = mock_chat
-            mock_genai.GenerativeModel.return_value = mock_model
-
-            yield {
-                "genai": mock_genai,
-                "model": mock_model,
-                "chat": mock_chat
-            }
+    """Tests for GeminiWrapper Plan Mode methods (CLI-based)."""
 
     @pytest.fixture
     def mock_scribe(self):
@@ -151,319 +136,283 @@ class TestGeminiWrapperPlanMode:
             mock_log.return_value = True
             yield mock_log
 
-    def test_generate_interview_questions(self, mock_gemini_model, mock_scribe):
+    @pytest.fixture
+    def mock_shutil(self):
+        """Mock shutil.which to return gemini path."""
+        with patch("shutil.which") as mock_which:
+            mock_which.return_value = "/usr/local/bin/gemini"
+            yield mock_which
+
+    @pytest.fixture
+    def wrapper(self, mock_scribe, mock_shutil):
+        """Create a GeminiWrapper instance with mocked dependencies."""
+        wrapper = GeminiWrapper(
+            working_directory="/test/project",
+            timeout_seconds=60,
+            verbose=False
+        )
+        yield wrapper
+        wrapper.close()
+
+    def test_generate_interview_questions(self, wrapper, mock_scribe):
         """Test interview question generation."""
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "interview_questions",
-            "content": {
-                "questions": [
-                    {
-                        "question": "How should we structure the API?",
-                        "focus": "architecture",
-                        "options": ["REST", "GraphQL"],
-                        "context": "API design decision",
-                        "follow_up_hint": "Consider client needs"
-                    },
-                    {
-                        "question": "What data format for storage?",
-                        "focus": "data_model",
-                        "options": ["JSON", "Relational"],
-                        "context": "Storage decision",
-                        "follow_up_hint": "Consider query patterns"
-                    }
-                ]
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+    "type": "interview_questions",
+    "content": {
+        "questions": [
+            {
+                "question": "How should we structure the API?",
+                "focus": "architecture",
+                "options": ["REST", "GraphQL"],
+                "context": "API design decision",
+                "follow_up_hint": "Consider client needs"
+            },
+            {
+                "question": "What data format for storage?",
+                "focus": "data_model",
+                "options": ["JSON", "Relational"],
+                "context": "Storage decision",
+                "follow_up_hint": "Consider query patterns"
             }
-        })
-        mock_gemini_model["chat"].send_message.return_value = mock_response
+        ]
+    }
+}
+```'''
 
-        wrapper = GeminiWrapper(api_key="test-key")
-        questions = wrapper.generate_interview_questions(
-            user_goal="Create a REST API",
-            project_context={"language": "Python"}
-        )
+            questions = wrapper.generate_interview_questions(
+                user_goal="Create a REST API",
+                project_context={"language": "Python"}
+            )
 
-        assert len(questions) == 2
-        assert questions[0].focus == InterviewFocus.ARCHITECTURE
-        assert "API" in questions[0].question
+            assert len(questions) == 2
+            assert questions[0].focus == InterviewFocus.ARCHITECTURE
+            assert "API" in questions[0].question
 
-    def test_generate_feature_spec(self, mock_gemini_model, mock_scribe):
+    def test_generate_feature_spec(self, wrapper, mock_scribe):
         """Test feature spec generation."""
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "feature_spec",
-            "content": {
-                "feature_name": "user_auth",
-                "summary": "User authentication system",
-                "requirements": ["Login", "Logout"],
-                "architecture_decisions": ["Use JWT"],
-                "data_model": {"User": {"id": "int"}},
-                "error_handling": ["401 for invalid credentials"],
-                "conventions": ["snake_case"],
-                "constraints": ["Postgres only"],
-                "out_of_scope": ["Social login"]
-            }
-        })
-        mock_gemini_model["chat"].send_message.return_value = mock_response
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+    "type": "feature_spec",
+    "content": {
+        "feature_name": "user_auth",
+        "summary": "User authentication system",
+        "requirements": ["Login", "Logout"],
+        "architecture_decisions": ["Use JWT"],
+        "data_model": {"User": {"id": "int"}},
+        "error_handling": ["401 for invalid credentials"],
+        "conventions": ["snake_case"],
+        "constraints": ["Postgres only"],
+        "out_of_scope": ["Social login"]
+    }
+}
+```'''
 
-        wrapper = GeminiWrapper(api_key="test-key")
+            question = InterviewQuestion(
+                question="Which auth method?",
+                focus=InterviewFocus.ARCHITECTURE,
+                options=["JWT", "Session"]
+            )
+            answers = [InterviewAnswer(question=question, answer="JWT")]
 
-        question = InterviewQuestion(
-            question="Which auth method?",
-            focus=InterviewFocus.ARCHITECTURE,
-            options=["JWT", "Session"]
-        )
-        answers = [InterviewAnswer(question=question, answer="JWT")]
+            spec = wrapper.generate_feature_spec(
+                user_goal="Add authentication",
+                interview_answers=answers
+            )
 
-        spec = wrapper.generate_feature_spec(
-            user_goal="Add authentication",
-            interview_answers=answers
-        )
+            assert spec.feature_name == "user_auth"
+            assert "Login" in spec.requirements
+            assert "Use JWT" in spec.architecture_decisions
 
-        assert spec.feature_name == "user_auth"
-        assert "Login" in spec.requirements
-        assert "Use JWT" in spec.architecture_decisions
-
-    def test_decompose_to_tasks(self, mock_gemini_model, mock_scribe):
+    def test_decompose_to_tasks(self, wrapper, mock_scribe):
         """Test task decomposition."""
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "task_decomposition",
-            "content": {
-                "tasks": [
-                    {
-                        "id": "task_001",
-                        "title": "Create User model",
-                        "goal": "Define User entity",
-                        "files_to_modify": ["src/models/user.py"],
-                        "expected_logic": "SQLAlchemy model with id, email, password_hash",
-                        "dependencies": [],
-                        "acceptance_criteria": ["Model created", "Migration generated"]
-                    },
-                    {
-                        "id": "task_002",
-                        "title": "Implement login endpoint",
-                        "goal": "POST /login",
-                        "files_to_modify": ["src/routes/auth.py"],
-                        "expected_logic": "Validate credentials, return JWT",
-                        "dependencies": ["task_001"],
-                        "acceptance_criteria": ["Endpoint returns JWT"]
-                    }
-                ]
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+    "type": "task_decomposition",
+    "content": {
+        "tasks": [
+            {
+                "id": "task_001",
+                "title": "Create User model",
+                "goal": "Define User entity",
+                "files_to_modify": ["src/models/user.py"],
+                "expected_logic": "SQLAlchemy model with id, email, password_hash",
+                "dependencies": [],
+                "acceptance_criteria": ["Model created", "Migration generated"]
+            },
+            {
+                "id": "task_002",
+                "title": "Implement login endpoint",
+                "goal": "POST /login",
+                "files_to_modify": ["src/routes/auth.py"],
+                "expected_logic": "Validate credentials, return JWT",
+                "dependencies": ["task_001"],
+                "acceptance_criteria": ["Endpoint returns JWT"]
             }
-        })
-        mock_gemini_model["chat"].send_message.return_value = mock_response
+        ]
+    }
+}
+```'''
 
-        wrapper = GeminiWrapper(api_key="test-key")
+            spec = FeatureSpec(
+                feature_name="user_auth",
+                summary="Auth system",
+                requirements=["Login", "Logout"]
+            )
 
-        spec = FeatureSpec(
-            feature_name="user_auth",
-            summary="Auth system",
-            requirements=["Login", "Logout"]
-        )
+            tasks = wrapper.decompose_to_tasks(spec)
 
-        tasks = wrapper.decompose_to_tasks(spec)
+            assert len(tasks) == 2
+            assert tasks[0].id == "task_001"
+            assert tasks[1].dependencies == ["task_001"]
 
-        assert len(tasks) == 2
-        assert tasks[0].id == "task_001"
-        assert tasks[1].dependencies == ["task_001"]
-
-    def test_validate_against_conventions(self, mock_gemini_model, mock_scribe):
+    def test_validate_against_conventions(self, wrapper, mock_scribe):
         """Test convention validation."""
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "convention_validation",
-            "content": {
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+    "type": "convention_validation",
+    "content": {
+        "approved": true,
+        "violations": [],
+        "warnings": ["Consider adding type hints"],
+        "recommendations": ["Follow existing patterns"]
+    }
+}
+```'''
+
+            tasks = [
+                PlanTask(
+                    id="task_001",
+                    title="Test task",
+                    goal="Test goal",
+                    files_to_modify=["src/test.py"]
+                )
+            ]
+
+            result = wrapper.validate_against_conventions(
+                tasks=tasks,
+                existing_conventions=["snake_case for functions", "Type hints required"]
+            )
+
+            assert result["approved"] is True
+            assert len(result["violations"]) == 0
+
+    def test_validate_against_conventions_with_violations(self, wrapper, mock_scribe):
+        """Test convention validation with violations."""
+        with patch.object(wrapper, '_send_message') as mock_send:
+            mock_send.return_value = '''```json
+{
+    "type": "convention_validation",
+    "content": {
+        "approved": false,
+        "violations": [
+            {
+                "task_id": "task_001",
+                "violation": "Uses camelCase",
+                "convention": "snake_case for functions",
+                "severity": "error",
+                "suggestion": "Rename to snake_case"
+            }
+        ],
+        "warnings": [],
+        "recommendations": []
+    }
+}
+```'''
+
+            tasks = [
+                PlanTask(id="task_001", title="Test", goal="Test")
+            ]
+
+            result = wrapper.validate_against_conventions(
+                tasks=tasks,
+                existing_conventions=["snake_case for functions"]
+            )
+
+            assert result["approved"] is False
+            assert len(result["violations"]) == 1
+
+    def test_run_plan_mode_full_flow(self, wrapper, mock_scribe):
+        """Test complete plan mode flow."""
+        with patch.object(wrapper, 'generate_interview_questions') as mock_q, \
+             patch.object(wrapper, 'generate_feature_spec') as mock_spec, \
+             patch.object(wrapper, 'decompose_to_tasks') as mock_tasks, \
+             patch.object(wrapper, 'validate_against_conventions') as mock_validate:
+
+            mock_q.return_value = [
+                InterviewQuestion(
+                    question="Which database?",
+                    focus=InterviewFocus.DATA_MODEL,
+                    options=["PostgreSQL", "MySQL"]
+                )
+            ]
+
+            mock_spec.return_value = FeatureSpec(
+                feature_name="test_feature",
+                summary="Test feature",
+                requirements=["Req1"]
+            )
+
+            mock_tasks.return_value = [
+                PlanTask(
+                    id="task_001",
+                    title="Task 1",
+                    goal="Goal 1",
+                    files_to_modify=["file.py"]
+                )
+            ]
+
+            mock_validate.return_value = {
                 "approved": True,
                 "violations": [],
-                "warnings": ["Consider adding type hints"],
-                "recommendations": ["Follow existing patterns"]
-            }
-        })
-        mock_gemini_model["chat"].send_message.return_value = mock_response
-
-        wrapper = GeminiWrapper(api_key="test-key")
-
-        tasks = [
-            PlanTask(
-                id="task_001",
-                title="Test task",
-                goal="Test goal",
-                files_to_modify=["src/test.py"]
-            )
-        ]
-
-        result = wrapper.validate_against_conventions(
-            tasks=tasks,
-            existing_conventions=["snake_case for functions", "Type hints required"]
-        )
-
-        assert result["approved"] is True
-        assert len(result["violations"]) == 0
-
-    def test_validate_against_conventions_with_violations(self, mock_gemini_model, mock_scribe):
-        """Test convention validation with violations."""
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "convention_validation",
-            "content": {
-                "approved": False,
-                "violations": [
-                    {
-                        "task_id": "task_001",
-                        "violation": "Uses camelCase",
-                        "convention": "snake_case for functions",
-                        "severity": "error",
-                        "suggestion": "Rename to snake_case"
-                    }
-                ],
                 "warnings": [],
                 "recommendations": []
             }
-        })
-        mock_gemini_model["chat"].send_message.return_value = mock_response
 
-        wrapper = GeminiWrapper(api_key="test-key")
+            on_question = MagicMock(return_value="PostgreSQL")
+            on_spec_review = MagicMock(return_value=True)
+            on_tasks_review = MagicMock(return_value=True)
 
-        tasks = [
-            PlanTask(id="task_001", title="Test", goal="Test")
-        ]
+            result = wrapper.run_plan_mode(
+                user_goal="Create a test feature",
+                existing_conventions=["snake_case"],
+                on_question=on_question,
+                on_spec_review=on_spec_review,
+                on_tasks_review=on_tasks_review
+            )
 
-        result = wrapper.validate_against_conventions(
-            tasks=tasks,
-            existing_conventions=["snake_case for functions"]
-        )
+            assert result.approved is True
+            assert result.feature_spec.feature_name == "test_feature"
+            assert len(result.tasks) == 1
+            on_question.assert_called()
+            on_spec_review.assert_called()
+            on_tasks_review.assert_called()
 
-        assert result["approved"] is False
-        assert len(result["violations"]) == 1
-
-    def test_run_plan_mode_full_flow(self, mock_gemini_model, mock_scribe):
-        """Test complete plan mode flow."""
-        # Setup mock responses for each step
-        responses = [
-            # 1. Interview questions
-            json.dumps({
-                "type": "interview_questions",
-                "content": {
-                    "questions": [
-                        {
-                            "question": "Which database?",
-                            "focus": "data_model",
-                            "options": ["PostgreSQL", "MySQL"],
-                            "context": "DB choice",
-                            "follow_up_hint": ""
-                        }
-                    ]
-                }
-            }),
-            # 2. Feature spec
-            json.dumps({
-                "type": "feature_spec",
-                "content": {
-                    "feature_name": "test_feature",
-                    "summary": "Test feature",
-                    "requirements": ["Req1"],
-                    "architecture_decisions": [],
-                    "data_model": {},
-                    "error_handling": [],
-                    "conventions": [],
-                    "constraints": [],
-                    "out_of_scope": []
-                }
-            }),
-            # 3. Task decomposition
-            json.dumps({
-                "type": "task_decomposition",
-                "content": {
-                    "tasks": [
-                        {
-                            "id": "task_001",
-                            "title": "Task 1",
-                            "goal": "Goal 1",
-                            "files_to_modify": ["file.py"],
-                            "expected_logic": "Logic",
-                            "dependencies": [],
-                            "acceptance_criteria": ["Done"]
-                        }
-                    ]
-                }
-            }),
-            # 4. Convention validation
-            json.dumps({
-                "type": "convention_validation",
-                "content": {
-                    "approved": True,
-                    "violations": [],
-                    "warnings": [],
-                    "recommendations": []
-                }
-            })
-        ]
-
-        response_iter = iter(responses)
-
-        def get_next_response(*args, **kwargs):
-            mock_resp = MagicMock()
-            mock_resp.text = next(response_iter)
-            return mock_resp
-
-        mock_gemini_model["chat"].send_message.side_effect = get_next_response
-
-        wrapper = GeminiWrapper(api_key="test-key")
-
-        # Mock callbacks
-        on_question = MagicMock(return_value="PostgreSQL")
-        on_spec_review = MagicMock(return_value=True)
-        on_tasks_review = MagicMock(return_value=True)
-
-        result = wrapper.run_plan_mode(
-            user_goal="Create a test feature",
-            existing_conventions=["snake_case"],
-            on_question=on_question,
-            on_spec_review=on_spec_review,
-            on_tasks_review=on_tasks_review
-        )
-
-        assert result.approved is True
-        assert result.feature_spec.feature_name == "test_feature"
-        assert len(result.tasks) == 1
-        on_question.assert_called()
-        on_spec_review.assert_called()
-        on_tasks_review.assert_called()
-
-    def test_run_plan_mode_spec_rejected(self, mock_gemini_model, mock_scribe):
+    def test_run_plan_mode_spec_rejected(self, wrapper, mock_scribe):
         """Test plan mode when spec is rejected."""
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "type": "interview_questions",
-            "content": {"questions": []}
-        })
-        mock_gemini_model["chat"].send_message.return_value = mock_response
+        with patch.object(wrapper, 'generate_interview_questions') as mock_q, \
+             patch.object(wrapper, 'generate_feature_spec') as mock_spec:
 
-        # Second call for feature spec
-        spec_response = MagicMock()
-        spec_response.text = json.dumps({
-            "type": "feature_spec",
-            "content": {
-                "feature_name": "test",
-                "summary": "Test"
-            }
-        })
+            mock_q.return_value = []
 
-        mock_gemini_model["chat"].send_message.side_effect = [mock_response, spec_response]
+            mock_spec.return_value = FeatureSpec(
+                feature_name="test",
+                summary="Test"
+            )
 
-        wrapper = GeminiWrapper(api_key="test-key")
+            on_spec_review = MagicMock(return_value=False)
 
-        # Reject the spec
-        on_spec_review = MagicMock(return_value=False)
+            result = wrapper.run_plan_mode(
+                user_goal="Test",
+                on_spec_review=on_spec_review
+            )
 
-        result = wrapper.run_plan_mode(
-            user_goal="Test",
-            on_spec_review=on_spec_review
-        )
-
-        assert result.approved is False
-        assert result.tasks == []
+            assert result.approved is False
+            assert result.tasks == []
 
 
 class TestScribePlanModeTools:
